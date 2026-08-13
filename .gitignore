@@ -1,0 +1,13 @@
+# Virtual env / IDE / caches
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# Runtime state (created by the GUI; holds last-used message)
+settings.json
+
+# Local debug/scratch artifacts
+data/
+scratch_windows.txt
+windows.txt
