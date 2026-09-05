@@ -1,4 +1,5 @@
-"""Tkinter control panel for claude_continue / antigravity_continue / codex_continue.
+"""Tkinter control panel for claude_continue / antigravity_continue /
+codex_continue / zcode_continue.
 
 Drives sender.send_loop in a background thread. Communicates with the Tk main
 loop through a queue.Queue polled every 100 ms.
@@ -148,18 +149,24 @@ class ContinueSenderGUI:
     def _build_layout(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        # Target
+        # Target. Two rows of two: measured with a withdrawn Tk root, four
+        # buttons side by side request 462 px, more than the 444 px the
+        # 460 px window leaves between the outer paddings — the ZCode button
+        # would be clipped, i.e. a target nobody can select. As a 2x2 grid
+        # the frame requests 292 px and fits.
         frame_target = ttk.LabelFrame(self.root, text="Target")
         frame_target.pack(fill="x", **pad)
-        ttk.Radiobutton(frame_target, text="Claude Desktop",
-                        variable=self.target_var, value="claude"
-                        ).pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(frame_target, text="Antigravity IDE",
-                        variable=self.target_var, value="antigravity"
-                        ).pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(frame_target, text="Codex",
-                        variable=self.target_var, value="codex"
-                        ).pack(side="left", padx=8, pady=4)
+        self.target_frame = frame_target
+        for i, (label, value) in enumerate((
+            ("Claude Desktop", "claude"),
+            ("Antigravity IDE", "antigravity"),
+            ("Codex", "codex"),
+            ("ZCode", "zcode"),
+        )):
+            ttk.Radiobutton(frame_target, text=label,
+                            variable=self.target_var, value=value
+                            ).grid(row=i // 2, column=i % 2, sticky="w",
+                                   padx=8, pady=4)
 
         # Message
         frame_msg = ttk.LabelFrame(self.root, text="Message")

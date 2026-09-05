@@ -1,8 +1,9 @@
-"""Print the windows sender.py would consider for a target and, for codex,
-the composer element UI Automation finds. Read-only: nothing is activated,
-clicked, or typed.
+"""Print the windows sender.py would consider for a target and, for the
+UIA-composer targets, the composer element UI Automation finds. Read-only:
+nothing is activated, clicked, or typed.
 
-Usage: python debug_windows.py [claude|antigravity|codex]   (default antigravity)
+Usage: python debug_windows.py [claude|antigravity|codex|zcode]
+       (default antigravity)
 """
 
 import sys
@@ -36,22 +37,32 @@ def _raw_matches(spec):
     return raw
 
 
-def _probe_codex_composer(hwnd):
+def _probe_composer(spec, hwnd):
+    """What sender's composer lookup finds in `hwnd` — the same FindAll the
+    real send would run, but nothing is focused, clicked or typed."""
     handles = sender._uia()
     if handles is None:
         print("UIA unavailable (comtypes missing or COM failure).")
         return
     uia, mod = handles
-    element = sender._find_codex_composer(uia, mod, hwnd)
+    element = sender._find_composer(uia, mod, hwnd, spec.composer_class,
+                                    log=print)
     if element is None:
-        print(f"No {sender.CODEX_COMPOSER_CLASS} edit element found in the "
-              f"window.")
+        pinned = (f"{spec.composer_class} edit element"
+                  if spec.composer_class else "edit element")
+        print(f"No {pinned} found in the window after "
+              f"{sender.COMPOSER_FIND_ATTEMPTS} attempts.")
         return
+    handle = sender.ComposerHandle(uia, mod, element)
     print(f"Composer: name={element.CurrentName!r} "
           f"class={element.CurrentClassName!r} "
           f"rect={sender._element_rect(element)} "
           f"focusable={bool(element.CurrentIsKeyboardFocusable)} "
           f"has_focus={bool(element.CurrentHasKeyboardFocus)}")
+    # The Value pattern is what the draft check and the post-typing read-back
+    # use; an empty composer reads as the placeholder (Codex) or "\n" (ZCode).
+    print(f"  value={sender._composer_text(handle)!r} "
+          f"draft={sender._composer_draft(handle)!r}")
 
 
 def main() -> None:
@@ -75,8 +86,8 @@ def main() -> None:
         windows, prefer_largest=spec.prefer_largest_window
     )
     print(f"Would use: {picked}")
-    if key == "codex" and picked is not None:
-        _probe_codex_composer(picked[0])
+    if spec.focus_method == "uia_composer" and picked is not None:
+        _probe_composer(spec, picked[0])
 
 
 if __name__ == "__main__":
