@@ -1,6 +1,7 @@
 """Shared core for typing a message into a target Windows application.
 
-Used by claude_continue.py, antigravity_continue.py, and gui.py.
+Used by claude_continue.py, antigravity_continue.py, codex_continue.py (via
+cli.py) and gui.py.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import pyautogui
 
@@ -21,6 +22,17 @@ pyautogui.FAILSAFE = False
 # Bound at import so the check keeps working when tests replace the pyautogui
 # module attribute with a mock.
 _is_valid_key = pyautogui.isValidKey
+
+# comtypes initialises COM for the importing thread at import time. Import it
+# here, on the main thread, so the first `import comtypes` never happens on a
+# worker thread that some library already put into the multi-threaded
+# apartment (that import would raise RPC_E_CHANGED_MODE before _uia()'s own
+# tolerance for it applies). Missing comtypes is handled in _uia().
+try:
+    import comtypes  # noqa: F401
+    import comtypes.client  # noqa: F401
+except Exception:
+    pass
 
 # Windows API constants
 SW_RESTORE = 9
@@ -44,13 +56,36 @@ user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint]
 user32.GetAncestor.restype = ctypes.wintypes.HWND
 
 
+def codex_message_problem(message: str) -> Optional[str]:
+    """Why `message` must not be typed into the Codex composer, or None.
+    A leading '/' opens the slash-command menu and '@' opens the mention
+    list, so Enter would pick a menu entry instead of sending the text."""
+    if message.lstrip().startswith("/"):
+        return ("starts with '/' (opens the Codex slash-command menu; Enter "
+                "would run a command instead of sending)")
+    if "@" in message:
+        return ("contains '@' (opens the Codex mention list; Enter would "
+                "pick a mention instead of sending)")
+    return None
+
+
 @dataclass(frozen=True)
 class TargetSpec:
     name: str
-    window_title_contains: str
+    window_title_contains: str  # "" disables title matching (exe-only target)
     exe_names: tuple[str, ...]
-    focus_method: str  # "click_bottom_center" or "hotkey_ctrl_l"
+    focus_method: str  # "click_bottom_center", "agent_input" or "uia_composer"
     blocklist: tuple[str, ...] = ()
+    # Pick the largest candidate window instead of the first (Z-order) one:
+    # for apps whose pop-ups share the main window's title and process.
+    prefer_largest_window: bool = False
+    # An exe-name match additionally needs one of these substrings in the
+    # lower-cased full image path (e.g. an MSIX package family), so a
+    # same-named executable of another app is not accepted.
+    exe_path_contains: tuple[str, ...] = ()
+    # Target-specific message validation: returns a reason to refuse the
+    # message, or None. Checked by the GUI up front and by send_once.
+    message_problem: Optional[Callable[[str], Optional[str]]] = None
 
 
 TARGETS: dict[str, TargetSpec] = {
@@ -68,12 +103,52 @@ TARGETS: dict[str, TargetSpec] = {
         focus_method="agent_input",
         blocklist=(),
     ),
+    # The Codex desktop app ships as the MSIX package OpenAI.Codex, but its
+    # process image is ChatGPT.exe (a Codex.exe launcher stub sits next to
+    # it). The window title is "ChatGPT", which would also match browser tabs
+    # and Explorer folders when the app is closed, so matching is exe-only —
+    # and the image path must lie in the OpenAI.Codex package, so a legacy
+    # stand-alone ChatGPT desktop install (also ChatGPT.exe) is not accepted.
+    # The app's quick-chat / hotkey pop-ups and the avatar overlay are
+    # windows of the same process with the same title; the primary window is
+    # the largest one.
+    "codex": TargetSpec(
+        name="Codex",
+        window_title_contains="",
+        exe_names=("chatgpt.exe", "codex.exe"),
+        focus_method="uia_composer",
+        blocklist=(),
+        prefer_largest_window=True,
+        exe_path_contains=("openai.codex",),
+        message_problem=codex_message_problem,
+    ),
 }
 
 # UIA control types that accept typed text. Chromium exposes the Antigravity
 # chat input as a ComboBox (50003); Edit (50004) and Document (50030) cover
 # ordinary inputs and rich-text editors.
 UIA_TEXT_ENTRY_TYPES = frozenset({50003, 50004, 50030})
+
+# The Codex desktop app composer, as seen by UI Automation: an Edit element
+# whose class is the ProseMirror editor root. It is the bottom-most such
+# element in the window (the button row below it holds no editors).
+UIA_EDIT_CONTROL_TYPE = 50004
+CODEX_COMPOSER_CLASS = "ProseMirror"
+# Chromium builds its accessibility tree lazily on first UIA contact; the
+# first FindAll after activation may legitimately come back empty.
+CODEX_COMPOSER_FIND_ATTEMPTS = 4
+CODEX_COMPOSER_FIND_DELAY_S = 1.0
+# Chromium applies a UIA focus request asynchronously, so the focus check is
+# polled briefly instead of read once.
+CODEX_FOCUS_POLL_ATTEMPTS = 5
+CODEX_FOCUS_POLL_DELAY_S = 0.15
+# Same for the text read-back after typing (the Value pattern lags a little).
+CODEX_TEXT_POLL_ATTEMPTS = 3
+CODEX_TEXT_POLL_DELAY_S = 0.2
+
+# Focus methods that verify, via UIA, that a text element still holds focus
+# after typing and before Enter is pressed.
+_VERIFIED_FOCUS_METHODS = frozenset({"agent_input", "uia_composer"})
 
 # Click-fallback geometry for the Agent Manager chat input, measured from the
 # live window: the input box is anchored to the window bottom, its editable
@@ -89,7 +164,9 @@ AGENT_INPUT_X_FRACTIONS = (0.42, 0.55, 0.30, 0.68)
 # Agent Manager window is titled after the active conversation instead.
 _IDE_TITLE_SUFFIX = "antigravity"
 
-def _get_process_name(hwnd) -> str:
+def _get_process_path(hwnd) -> str:
+    """Lower-cased full image path of the process owning `hwnd`, '' if it
+    cannot be read."""
     pid = ctypes.wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     h_process = kernel32.OpenProcess(
@@ -98,12 +175,32 @@ def _get_process_name(hwnd) -> str:
     if not h_process:
         return ""
     try:
-        buf = ctypes.create_unicode_buffer(260)
-        size = ctypes.wintypes.DWORD(260)
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.wintypes.DWORD(1024)
         kernel32.QueryFullProcessImageNameW(h_process, 0, buf, ctypes.byref(size))
-        return buf.value.rsplit("\\", 1)[-1].lower() if buf.value else ""
+        return buf.value.lower() if buf.value else ""
     finally:
         kernel32.CloseHandle(h_process)
+
+
+def _get_process_name(hwnd) -> str:
+    """Lower-cased image file name (e.g. 'claude.exe') of the process owning
+    `hwnd`, '' if it cannot be read."""
+    return _get_process_path(hwnd).rsplit("\\", 1)[-1]
+
+
+def _matches_spec(spec: TargetSpec, title: str, exe: str, path: str = "") -> bool:
+    """Window (title, exe, image path) belongs to `spec`. Title matching is
+    opt-in: an empty window_title_contains means exe-only (see the codex
+    target). An exe match must also satisfy exe_path_contains when set."""
+    needle = spec.window_title_contains.lower()
+    if needle and title and needle in title.lower():
+        return True
+    if exe not in spec.exe_names:
+        return False
+    if spec.exe_path_contains:
+        return any(part in path for part in spec.exe_path_contains)
+    return True
 
 
 def find_target_windows(spec: TargetSpec) -> list[tuple[int, str]]:
@@ -118,8 +215,9 @@ def find_target_windows(spec: TargetSpec) -> list[tuple[int, str]]:
                 # Only consider unowned (main) windows to avoid invisible overlays
                 if user32.GetWindow(hwnd, GW_OWNER) != 0:
                     return True
-                
-                exe = _get_process_name(hwnd)
+
+                path = _get_process_path(hwnd)
+                exe = path.rsplit("\\", 1)[-1]
 
                 length = user32.GetWindowTextLengthW(hwnd)
                 title = ""
@@ -127,8 +225,8 @@ def find_target_windows(spec: TargetSpec) -> list[tuple[int, str]]:
                     buf = ctypes.create_unicode_buffer(length + 1)
                     user32.GetWindowTextW(hwnd, buf, length + 1)
                     title = buf.value
-                
-                if (title and spec.window_title_contains.lower() in title.lower()) or exe in spec.exe_names:
+
+                if _matches_spec(spec, title, exe, path):
                     matches.append((hwnd, title, exe))
         except Exception as e:
             import traceback
@@ -176,13 +274,16 @@ MIN_MAIN_WINDOW_H = 200
 
 
 def _pick_main_window(
-    windows: list[tuple[int, str]]
+    windows: list[tuple[int, str]], prefer_largest: bool = False,
 ) -> Optional[tuple[int, str]]:
-    """First visible window that plausibly is the main app window. Minimized
-    windows are only a fallback: their rect is meaningless (-32000 coords)
-    until force_activate_window restores them, so their true size is unknown
-    and a visible full-size window is the safer pick."""
+    """First visible window that plausibly is the main app window — or, with
+    `prefer_largest`, the largest such window. Minimized windows are only a
+    fallback: their rect is meaningless (-32000 coords) until
+    force_activate_window restores them, so their true size is unknown and a
+    visible full-size window is the safer pick."""
     iconic_fallback = None
+    best = None
+    best_area = -1
     for hwnd, title in windows:
         if user32.IsIconic(hwnd):
             if iconic_fallback is None:
@@ -190,8 +291,11 @@ def _pick_main_window(
             continue
         _left, _top, width, height = get_window_rect(hwnd)
         if width >= MIN_MAIN_WINDOW_W and height >= MIN_MAIN_WINDOW_H:
-            return hwnd, title
-    return iconic_fallback
+            if not prefer_largest:
+                return hwnd, title
+            if width * height > best_area:
+                best, best_area = (hwnd, title), width * height
+    return best if best is not None else iconic_fallback
 
 
 def _is_foreground(hwnd) -> bool:
@@ -239,23 +343,198 @@ def force_activate_window(hwnd) -> bool:
     return _is_foreground(hwnd)
 
 
-def _focused_control_type() -> Optional[int]:
-    """UIA control type of the element that has keyboard focus, or None when
-    it cannot be read (comtypes missing, COM failure). None means "cannot
-    verify", not "verification failed" — callers must not treat it as a
-    mismatch."""
+# CoInitialize on a thread that some library already put into the
+# multi-threaded apartment: COM is initialised and usable, just not in the
+# apartment comtypes asked for.
+_RPC_E_CHANGED_MODE = -2147417850
+
+
+def _uia():
+    """(IUIAutomation client, UIAutomationCore module) or None when UI
+    Automation cannot be used (comtypes missing, COM failure). None means
+    "cannot verify", never "verification failed"."""
     try:
         import comtypes
         import comtypes.client
-        comtypes.CoInitialize()
+        try:
+            comtypes.CoInitialize()
+        except OSError as e:
+            if getattr(e, "winerror", None) != _RPC_E_CHANGED_MODE:
+                raise
         mod = comtypes.client.GetModule("UIAutomationCore.dll")
         uia = comtypes.client.CreateObject(
             "{ff48dba4-60ef-4201-aa87-54103eef594e}",  # CLSID_CUIAutomation
             interface=mod.IUIAutomation,
         )
+        return uia, mod
+    except Exception:
+        return None
+
+
+def _focused_control_type() -> Optional[int]:
+    """UIA control type of the element that has keyboard focus, or None when
+    it cannot be read. None means "cannot verify", not "verification
+    failed" — callers must not treat it as a mismatch."""
+    handles = _uia()
+    if handles is None:
+        return None
+    uia, _mod = handles
+    try:
         return int(uia.GetFocusedElement().CurrentControlType)
     except Exception:
         return None
+
+
+def _element_rect(element) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of a UIA element in physical pixels —
+    pyautogui makes this process DPI-aware at import, so these coordinates
+    can be clicked directly."""
+    r = element.CurrentBoundingRectangle
+    return int(r.left), int(r.top), int(r.right), int(r.bottom)
+
+
+def _find_codex_composer(uia, mod, hwnd, log: Callable[[str], None] = None):
+    """Bottom-most ProseMirror edit element inside `hwnd`, or None.
+
+    A COM error during an attempt (provider not ready yet, element gone
+    between two calls) counts like an empty result: it is logged and the
+    next attempt runs — the retry budget exists exactly for that."""
+    condition = uia.CreateAndCondition(
+        uia.CreatePropertyCondition(mod.UIA_ControlTypePropertyId,
+                                    UIA_EDIT_CONTROL_TYPE),
+        uia.CreatePropertyCondition(mod.UIA_ClassNamePropertyId,
+                                    CODEX_COMPOSER_CLASS),
+    )
+    for attempt in range(CODEX_COMPOSER_FIND_ATTEMPTS):
+        if attempt:
+            time.sleep(CODEX_COMPOSER_FIND_DELAY_S)
+        try:
+            root = uia.ElementFromHandle(hwnd)
+            found = root.FindAll(mod.TreeScope_Descendants, condition)
+            best = None
+            best_bottom = None
+            for i in range(found.Length):
+                try:
+                    element = found.GetElement(i)
+                    left, top, right, bottom = _element_rect(element)
+                except Exception:
+                    continue  # element vanished mid-scan; look at the rest
+                if right <= left or bottom <= top:
+                    continue  # collapsed/offscreen editor, cannot be clicked
+                if best is None or bottom > best_bottom:
+                    best, best_bottom = element, bottom
+        except Exception as e:
+            if log is not None:
+                log(f"[INFO] UIA query failed on attempt {attempt + 1}: {e}")
+            continue
+        if best is not None:
+            return best
+    return None
+
+
+def _is_element_focused(uia, element) -> bool:
+    """True if `element` holds keyboard focus, judged by two independent
+    signals that must both agree: the system-wide focused element is this
+    one (UIA CompareElements, verified stable across queries in the Codex
+    app; as a guard against a version where it is not, a focused ProseMirror
+    edit at exactly the same bounding rectangle counts too — a different
+    editor never sits at the composer's bottom-anchored rectangle), and the
+    element itself reports HasKeyboardFocus. A window that could not become
+    foreground can mark its element focused internally while keystrokes
+    would land elsewhere; the system-wide check catches that."""
+    try:
+        focused = uia.GetFocusedElement()
+        same = bool(uia.CompareElements(focused, element)) or (
+            int(focused.CurrentControlType) == UIA_EDIT_CONTROL_TYPE
+            and (focused.CurrentClassName or "") == CODEX_COMPOSER_CLASS
+            and _element_rect(focused) == _element_rect(element)
+        )
+        return same and bool(element.CurrentHasKeyboardFocus)
+    except Exception:
+        return False
+
+
+def _wait_for_focus(uia, element) -> bool:
+    """Poll _is_element_focused: Chromium honours SetFocus/clicks a little
+    after the call returns."""
+    for attempt in range(CODEX_FOCUS_POLL_ATTEMPTS):
+        if attempt:
+            time.sleep(CODEX_FOCUS_POLL_DELAY_S)
+        if _is_element_focused(uia, element):
+            return True
+    return False
+
+
+class ComposerHandle(NamedTuple):
+    """A focused text element plus the UIA client it came from, so the text
+    typed into it can be read back before Enter is pressed."""
+    uia: object
+    mod: object
+    element: object
+
+
+def _composer_text(handle: ComposerHandle) -> Optional[str]:
+    """Text the composer currently holds (UIA Value pattern; the empty
+    composer reports its placeholder). None when it cannot be read — that
+    means "cannot verify", not "empty"."""
+    try:
+        pattern = handle.element.GetCurrentPattern(handle.mod.UIA_ValuePatternId)
+        if not pattern:
+            return None
+        value = pattern.QueryInterface(handle.mod.IUIAutomationValuePattern)
+        raw = value.CurrentValue
+        # A NULL BSTR arrives as None: unreadable, not the word "None".
+        return None if raw is None else str(raw)
+    except Exception:
+        return None
+
+
+def _composer_draft(handle: ComposerHandle) -> Optional[str]:
+    """Text already sitting in the composer: '' when it is empty (the Value
+    pattern then reports the placeholder, which equals the element's
+    accessible name), the draft otherwise, None when it cannot be read."""
+    text = _composer_text(handle)
+    if text is None:
+        return None
+    stripped = text.strip()
+    try:
+        placeholder = (handle.element.CurrentName or "").strip()
+    except Exception:
+        placeholder = ""
+    if not stripped or (placeholder and stripped == placeholder):
+        return ""
+    return stripped
+
+
+def _verify_typed_text(
+    handle: ComposerHandle, message: str, log: Callable[[str], None],
+    baseline: Optional[str] = None,
+) -> None:
+    """Assert the effect of typing, not the action: the composer's own text
+    must contain `message` AND differ from `baseline` (the text read before
+    typing — the empty composer reports its placeholder, and a short message
+    such as 'hi' is a substring of 'Do anything'). Only a run in which no
+    poll could be read at all is "cannot verify" (a warning); any readable
+    mismatch aborts the send, whichever poll produced it."""
+    before = (baseline or "").strip()
+    last_readable = None
+    for attempt in range(CODEX_TEXT_POLL_ATTEMPTS):
+        if attempt:
+            time.sleep(CODEX_TEXT_POLL_DELAY_S)
+        text = _composer_text(handle)
+        if text is None:
+            continue
+        last_readable = text
+        if message in text and (baseline is None or text.strip() != before):
+            return
+    if last_readable is None:
+        log("[WARN] Could not read the composer text back; trusting the "
+            "keystrokes.")
+        return
+    raise RuntimeError(
+        f"Composer text after typing is {last_readable!r}, which does not "
+        f"show {message!r} as newly typed text; not pressing Enter."
+    )
 
 
 def _window_dpi_scale(hwnd) -> float:
@@ -333,23 +612,85 @@ def _focus_ide_agent_panel(log: Callable[[str], None]) -> None:
         )
 
 
+def _focus_codex_composer(
+    hwnd, log: Callable[[str], None],
+) -> Optional[ComposerHandle]:
+    """Focus the composer of the Codex desktop app (ChatGPT.exe).
+
+    No keyboard shortcut is safe here: the app ships no default binding that
+    focuses the composer, Shift+Escape is 'clear all unreads', and plain
+    Escape STOPS a running turn before it would ever focus the composer. So
+    the composer is located through UI Automation (bottom-most ProseMirror
+    edit element), focused via UIA SetFocus and verified; a click into the
+    element is the fallback. Every failure — UIA unavailable, composer not
+    found, focus not taken, a draft already in the box — raises before
+    anything is typed. Returns the focused element so send_once can re-check
+    focus and read the typed text back before Enter."""
+    handles = _uia()
+    if handles is None:
+        raise RuntimeError(
+            "UI Automation is unavailable (comtypes missing or COM failure); "
+            "refusing to type into the Codex composer unverified."
+        )
+    uia, mod = handles
+    composer = _find_codex_composer(uia, mod, hwnd, log=log)
+    if composer is None:
+        raise RuntimeError(
+            f"Could not find the Codex composer (no {CODEX_COMPOSER_CLASS} "
+            f"edit element in the window after "
+            f"{CODEX_COMPOSER_FIND_ATTEMPTS} attempts). Not typing."
+        )
+    try:
+        composer.SetFocus()
+    except Exception as e:
+        log(f"[INFO] UIA SetFocus failed ({e}); falling back to a click.")
+    if not _wait_for_focus(uia, composer):
+        left, top, right, bottom = _element_rect(composer)
+        click_x, click_y = (left + right) // 2, (top + bottom) // 2
+        log(f"[INFO] Composer not focused after SetFocus; clicking "
+            f"({click_x}, {click_y}).")
+        pyautogui.click(click_x, click_y)
+        if not _wait_for_focus(uia, composer):
+            raise RuntimeError(
+                "Could not focus the Codex composer (SetFocus and a click "
+                "both left focus elsewhere). Not typing."
+            )
+
+    handle = ComposerHandle(uia, mod, composer)
+    draft = _composer_draft(handle)
+    if draft is None:
+        log("[WARN] Could not read the composer text; cannot tell whether a "
+            "draft is already there.")
+    elif draft:
+        raise RuntimeError(
+            f"The Codex composer already contains text ({draft!r}); not "
+            f"typing on top of a draft."
+        )
+    return handle
+
+
 def _focus_input(
     spec: TargetSpec, hwnd, title: str,
     log: Callable[[str], None] = print,
-) -> None:
+) -> Optional[ComposerHandle]:
+    """Focus the target's input. Returns a ComposerHandle when the focused
+    element is known (uia_composer), else None."""
     if spec.focus_method == "click_bottom_center":
         left, top, width, height = get_window_rect(hwnd)
         click_x = left + width // 2
         click_y = top + height - 80
         pyautogui.click(click_x, click_y)
         time.sleep(0.5)
-    elif spec.focus_method == "agent_input":
+        return None
+    if spec.focus_method == "agent_input":
         if title.strip().lower().endswith(_IDE_TITLE_SUFFIX):
             _focus_ide_agent_panel(log)
         else:
             _focus_agent_manager_input(hwnd, log)
-    else:
-        raise ValueError(f"Unknown focus_method: {spec.focus_method}")
+        return None
+    if spec.focus_method == "uia_composer":
+        return _focus_codex_composer(hwnd, log)
+    raise ValueError(f"Unknown focus_method: {spec.focus_method}")
 
 
 def send_once(
@@ -368,14 +709,20 @@ def send_once(
             f"Is it running?"
         )
 
-    picked = _pick_main_window(windows)
+    picked = _pick_main_window(
+        windows, prefer_largest=spec.prefer_largest_window
+    )
     if picked is None:
         raise RuntimeError(
             f"Found {len(windows)} {spec.name} window(s), but none looks "
             f"like a main window (all tiny/overlay windows)."
         )
     hwnd, title = picked
-    log(f"[INFO] Using window: '{title}' (handle: {hwnd})")
+    if len(windows) > 1:
+        log(f"[INFO] {len(windows)} candidate windows: "
+            + ", ".join(f"{h} '{t}'" for h, t in windows))
+    log(f"[INFO] Using window: '{title}' (handle: {hwnd}, "
+        f"exe: {_get_process_path(hwnd) or '?'})")
 
     bad = unsupported_chars(message)
     if bad:
@@ -383,6 +730,12 @@ def send_once(
             f"Message contains characters that typing would silently drop "
             f"or misinterpret: {bad!r}. Use plain single-line ASCII text."
         )
+    if spec.message_problem is not None:
+        problem = spec.message_problem(message)
+        if problem:
+            raise RuntimeError(
+                f"Message {problem}. Not typing it into {spec.name}."
+            )
 
     # Release possibly-stuck modifiers BEFORE activating the target: a stray
     # Alt key-up delivered to the target window can focus its menu bar, and
@@ -398,18 +751,37 @@ def send_once(
         )
     time.sleep(1.0)
 
-    _focus_input(spec, hwnd, title, log=log)
+    handle = _focus_input(spec, hwnd, title, log=log)
+    baseline = None
+    if isinstance(handle, ComposerHandle):
+        baseline = _composer_text(handle)  # what the box shows before typing
 
     log(f"[INFO] Typing '{message}'...")
     pyautogui.typewrite(message, interval=0.05)
     time.sleep(0.3)
-    if spec.focus_method == "agent_input":
+    if spec.focus_method in _VERIFIED_FOCUS_METHODS:
         ct = _focused_control_type()
         if ct is not None and ct not in UIA_TEXT_ENTRY_TYPES:
             raise RuntimeError(
-                f"Focus left the agent input while typing (control type "
+                f"Focus left the input while typing (control type "
                 f"{ct}); not pressing Enter."
             )
+    if isinstance(handle, ComposerHandle):
+        # Re-check against the very element that was focused, not just any
+        # text control on the desktop: the window must still be foreground,
+        # the composer must still hold focus, and the typed text must be in
+        # it. Each check is independent of a fresh COM bootstrap.
+        if not _is_foreground(hwnd):
+            raise RuntimeError(
+                f"The {spec.name} window lost the foreground while typing; "
+                f"not pressing Enter."
+            )
+        if not _is_element_focused(handle.uia, handle.element):
+            raise RuntimeError(
+                f"The {spec.name} composer lost focus while typing; not "
+                f"pressing Enter."
+            )
+        _verify_typed_text(handle, message, log, baseline=baseline)
     pyautogui.press("enter")
     time.sleep(0.3)
 

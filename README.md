@@ -1,8 +1,9 @@
 # Continue Sender
 
-Sends a text message (default `continue`) to **Claude Desktop** or **Google
-Antigravity IDE** — once, after a delay, or on a repeating schedule. Useful
-when a rate-limit reset unblocks a paused conversation.
+Sends a text message (default `continue`) to **Claude Desktop**, **Google
+Antigravity IDE** or the **OpenAI Codex desktop app** — once, after a delay,
+or on a repeating schedule. Useful when a rate-limit reset unblocks a paused
+conversation.
 
 ## Requirements
 
@@ -14,7 +15,7 @@ when a rate-limit reset unblocks a paused conversation.
 
 Tkinter is used by the GUI and ships with Python on Windows.
 
-## The three entry points
+## The entry points
 
 ### GUI (recommended)
 
@@ -42,7 +43,13 @@ python claude_continue.py --message "keep going"
 python antigravity_continue.py [same flags as above]
 ```
 
-## Flags (both CLIs)
+### Codex desktop app CLI
+
+```
+python codex_continue.py [same flags as above]
+```
+
+## Flags (all CLIs)
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -68,6 +75,23 @@ Ctrl+C cancels a running CLI cleanly.
   first). If the input still doesn't hold focus, the send is aborted with an
   error instead of typing into the wrong place — and after typing, focus is
   re-checked before Enter is pressed.
+- The **Codex desktop app** (MSIX package `OpenAI.Codex`; its process is
+  `ChatGPT.exe`, matched by exe name plus package path because its window
+  title `ChatGPT` also fits browser tabs and Explorer folders, and a legacy
+  stand-alone ChatGPT install is the same exe) has no safe focus shortcut:
+  the app ships none for the composer, `Shift+Esc` clears unreads and plain
+  `Esc` *stops a running turn*. The composer is therefore located through UI
+  Automation (the bottom-most `ProseMirror` edit element), focused with UIA
+  `SetFocus` (polled, since Chromium applies it asynchronously), and clicked
+  as a fallback. The send is aborted, without typing, if UI Automation is
+  unavailable, the composer cannot be found or focused, or it already holds
+  a draft. After typing, the window must still be foreground, the composer
+  element must still hold focus, and the text read back from the composer
+  must contain the message before Enter is pressed. Messages starting with
+  `/` or containing `@` are refused for this target: they open the
+  slash-command menu or the mention list, and Enter would pick a menu entry.
+  `python debug_windows.py codex` shows what UIA sees without sending
+  anything.
 - Messages must be plain single-line ASCII: `pyautogui.typewrite` silently
   drops characters it cannot map (umlauts, Vietnamese diacritics, emoji), so
   such messages are rejected up front instead of "sending" incomplete text.
@@ -86,8 +110,12 @@ Ctrl+C cancels a running CLI cleanly.
 ## Files
 
 - `sender.py` — shared core (window finding, activation, focus, send loop)
+- `cli.py` — shared argparse surface of the CLI wrappers
 - `claude_continue.py` — CLI wrapper for Claude Desktop
 - `antigravity_continue.py` — CLI wrapper for Antigravity IDE
+- `codex_continue.py` — CLI wrapper for the Codex desktop app
+- `debug_windows.py [target]` — read-only listing of the candidate windows
+  (and, for `codex`, the composer element UI Automation finds)
 - `gui.py` — Tkinter control panel
 - `settings.json` — created by the GUI; last-used values
 - `tests/` — regression tests (`python -m unittest discover -s tests`);
