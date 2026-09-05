@@ -9,12 +9,16 @@ import contextlib
 import io
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import antigravity_continue
+import claude_continue
+import codex_continue
 import gui
 import sender
 from sender import TargetSpec
@@ -28,6 +32,52 @@ def _spec(blocklist=(), exe_names=("target.exe",)):
         focus_method="click_bottom_center",
         blocklist=blocklist,
     )
+
+
+def _fake_element(rect, cls="ProseMirror", ctype=50004, has_focus=True):
+    """A stand-in for an IUIAutomationElement."""
+    el = mock.Mock()
+    r = mock.Mock()
+    r.left, r.top, r.right, r.bottom = rect
+    el.CurrentBoundingRectangle = r
+    el.CurrentClassName = cls
+    el.CurrentControlType = ctype
+    el.CurrentHasKeyboardFocus = 1 if has_focus else 0
+    return el
+
+
+def _fake_handle(value="continue", pattern_available=True):
+    """A ComposerHandle whose element's Value pattern reports `value`."""
+    element = _fake_element((41, 1649, 986, 1713))
+    pattern = mock.Mock()
+    pattern.__bool__ = lambda _self: pattern_available
+    pattern.QueryInterface.return_value.CurrentValue = value
+    element.GetCurrentPattern.return_value = pattern
+    mod = types.SimpleNamespace(UIA_ValuePatternId=10002,
+                                IUIAutomationValuePattern=object())
+    return sender.ComposerHandle(mock.Mock(), mod, element)
+
+
+def _fake_uia(find_results):
+    """(uia, mod) whose root.FindAll returns the element lists in
+    `find_results`, one list per call."""
+    uia = mock.Mock()
+    mod = types.SimpleNamespace(UIA_ControlTypePropertyId=30003,
+                                UIA_ClassNamePropertyId=30012,
+                                TreeScope_Descendants=4)
+    calls = iter(find_results)
+
+    def find_all(_scope, _cond):
+        elems = next(calls)
+        arr = mock.Mock()
+        arr.Length = len(elems)
+        arr.GetElement.side_effect = lambda i: elems[i]
+        return arr
+
+    root = mock.Mock()
+    root.FindAll.side_effect = find_all
+    uia.ElementFromHandle.return_value = root
+    return uia, mod
 
 
 class SelectMatchesTests(unittest.TestCase):
@@ -119,6 +169,26 @@ class PickMainWindowTests(unittest.TestCase):
                                side_effect=lambda h: rects[h]):
             picked = sender._pick_main_window([(1, "minimized"), (2, "main")])
         self.assertEqual(picked, (2, "main"))
+
+    def test_prefer_largest_picks_the_biggest_qualifying_window(self):
+        # Codex: quick-chat / hotkey pop-ups and the avatar overlay are
+        # windows of the same process with the same title "ChatGPT"; the
+        # primary window is the largest one, whatever the Z-order.
+        stub = mock.Mock()
+        stub.IsIconic.return_value = 0
+        rects = {1: (0, 0, 560, 400), 2: (0, 0, 1200, 800), 3: (0, 0, 300, 300)}
+        with mock.patch.object(sender, "user32", stub), \
+             mock.patch.object(sender, "get_window_rect",
+                               side_effect=lambda h: rects[h]):
+            windows = [(1, "ChatGPT"), (2, "ChatGPT"), (3, "ChatGPT")]
+            self.assertEqual(sender._pick_main_window(windows), (1, "ChatGPT"))
+            self.assertEqual(
+                sender._pick_main_window(windows, prefer_largest=True),
+                (2, "ChatGPT"))
+
+    def test_codex_spec_prefers_largest_window(self):
+        self.assertTrue(sender.TARGETS["codex"].prefer_largest_window)
+        self.assertFalse(sender.TARGETS["antigravity"].prefer_largest_window)
 
 
 def _stub_user32(foreground_hwnd):
@@ -328,6 +398,9 @@ class ValidateSettingsTests(unittest.TestCase):
         self.assertTrue(gui.validate_settings(
             self._settings(repeat_enabled=True)))
 
+    def test_codex_target_accepted(self):
+        self.assertIsNone(gui.validate_settings(self._settings(target="codex")))
+
 
 def _antigravity_spec():
     return sender.TARGETS["antigravity"]
@@ -512,6 +585,16 @@ class SendOnceFocusSafetyTests(unittest.TestCase):
             fake.typewrite.assert_called_once()
             fake.press.assert_not_called()
 
+    def test_enter_still_pressed_when_uia_cannot_verify(self):
+        # Contract of _focused_control_type: None means "cannot verify", not
+        # "verification failed" — the documented shortcut is trusted.
+        fake = mock.Mock()
+        patches = self._base_patches(fake, focused_types=[None])
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6]:
+            sender.send_once("antigravity", "continue", log=lambda _t: None)
+        fake.press.assert_called_once_with("enter")
+
 
 class EventPumpTests(unittest.TestCase):
     def test_pump_reschedules_even_if_a_handler_raises(self):
@@ -527,6 +610,760 @@ class EventPumpTests(unittest.TestCase):
         except Exception:
             pass  # the raise may propagate; rescheduling must happen anyway
         g.root.after.assert_called_once()
+
+
+class ExeOnlyMatchingTests(unittest.TestCase):
+    """An empty window_title_contains disables title matching. The Codex app
+    window is titled 'ChatGPT', which would also match browser tabs, Explorer
+    folders and editor buffers when the app is NOT running; exe-only matching
+    reports 'not running' instead of typing into one of those."""
+
+    def _exe_only(self, exe_names=("chatgpt.exe",)):
+        return TargetSpec(name="Codex", window_title_contains="",
+                          exe_names=exe_names, focus_method="uia_composer")
+
+    def test_empty_title_needle_never_matches_by_title(self):
+        spec = self._exe_only()
+        self.assertFalse(sender._matches_spec(
+            spec, "ChatGPT - Google Chrome", "chrome.exe"))
+        self.assertFalse(sender._matches_spec(spec, "anything", "explorer.exe"))
+
+    def test_empty_title_needle_still_matches_by_exe(self):
+        spec = self._exe_only()
+        self.assertTrue(sender._matches_spec(spec, "ChatGPT", "chatgpt.exe"))
+        self.assertTrue(sender._matches_spec(spec, "", "chatgpt.exe"))
+
+    def test_non_empty_needle_keeps_title_matching(self):
+        spec = _spec()  # window_title_contains="Target"
+        self.assertTrue(sender._matches_spec(spec, "my target app", "other.exe"))
+        self.assertFalse(sender._matches_spec(spec, "nothing here", "other.exe"))
+        self.assertTrue(sender._matches_spec(spec, "nothing here", "target.exe"))
+
+    def test_exe_match_requires_package_path_when_configured(self):
+        # A legacy stand-alone ChatGPT desktop install is also ChatGPT.exe
+        # (and the same Chromium/ProseMirror UI); only the OpenAI.Codex
+        # package may be targeted.
+        spec = sender.TARGETS["codex"]
+        codex_path = (r"c:\program files\windowsapps"
+                      r"\openai.codex_26.901.4073.0_x64__2p2nqsd0c76g0"
+                      r"\app\chatgpt.exe")
+        legacy_path = (r"c:\program files\windowsapps"
+                       r"\openai.chatgpt-desktop_1.2.3_x64__abc\app\chatgpt.exe")
+        self.assertTrue(sender._matches_spec(spec, "ChatGPT", "chatgpt.exe",
+                                             codex_path))
+        self.assertFalse(sender._matches_spec(spec, "ChatGPT", "chatgpt.exe",
+                                              legacy_path))
+        self.assertFalse(sender._matches_spec(spec, "ChatGPT", "chatgpt.exe"))
+
+    def test_specs_without_path_requirement_ignore_the_path(self):
+        spec = _spec()
+        self.assertTrue(sender._matches_spec(spec, "", "target.exe",
+                                             r"c:\anywhere\target.exe"))
+
+
+def _stub_enum_user32(windows):
+    """user32 stub for find_target_windows. `windows` maps hwnd -> dict with
+    title, visible, owner (0 = unowned)."""
+    u = mock.Mock()
+
+    def enum(cb, lparam):
+        for h in windows:
+            cb(h, lparam)
+        return 1
+
+    def get_text(h, buf, _n):
+        buf.value = windows[h]["title"]
+        return len(buf.value)
+
+    u.EnumWindows.side_effect = enum
+    u.IsWindowVisible.side_effect = lambda h: windows[h]["visible"]
+    u.GetWindow.side_effect = lambda h, _cmd: windows[h]["owner"]
+    u.GetWindowTextLengthW.side_effect = lambda h: len(windows[h]["title"])
+    u.GetWindowTextW.side_effect = get_text
+    return u
+
+
+class FindTargetWindowsTests(unittest.TestCase):
+    """The enumeration that decides which window receives the keystrokes,
+    driven end to end with a stubbed EnumWindows: the image path produced
+    here is what _matches_spec judges."""
+
+    CODEX = (r"c:\program files\windowsapps"
+             r"\openai.codex_26.901.4073.0_x64__2p2nqsd0c76g0\app\chatgpt.exe")
+    LEGACY = (r"c:\program files\windowsapps"
+              r"\openai.chatgpt-desktop_1.0_x64__abc\app\chatgpt.exe")
+
+    def _find(self, windows, paths, spec=None):
+        spec = spec or sender.TARGETS["codex"]
+        with mock.patch.object(sender, "user32", _stub_enum_user32(windows)), \
+             mock.patch.object(sender, "_get_process_path",
+                               side_effect=lambda h: paths[h]):
+            return sender.find_target_windows(spec)
+
+    def test_codex_package_window_is_found(self):
+        windows = {1: dict(title="ChatGPT", visible=1, owner=0)}
+        self.assertEqual(self._find(windows, {1: self.CODEX}),
+                         [(1, "ChatGPT")])
+
+    def test_legacy_chatgpt_install_is_rejected(self):
+        windows = {1: dict(title="ChatGPT", visible=1, owner=0)}
+        self.assertEqual(self._find(windows, {1: self.LEGACY}), [])
+
+    def test_hidden_and_owned_windows_are_skipped(self):
+        windows = {
+            1: dict(title="ChatGPT", visible=0, owner=0),   # hidden
+            2: dict(title="ChatGPT", visible=1, owner=99),  # owned pop-up
+            3: dict(title="ChatGPT", visible=1, owner=0),
+        }
+        paths = {1: self.CODEX, 2: self.CODEX, 3: self.CODEX}
+        self.assertEqual(self._find(windows, paths), [(3, "ChatGPT")])
+
+    def test_title_match_still_works_for_title_targets(self):
+        windows = {1: dict(title="Claude", visible=1, owner=0)}
+        found = self._find(windows, {1: r"c:\apps\claude\claude.exe"},
+                           spec=sender.TARGETS["claude"])
+        self.assertEqual(found, [(1, "Claude")])
+
+
+class CodexTargetSpecTests(unittest.TestCase):
+    def test_codex_target_shape(self):
+        spec = sender.TARGETS["codex"]
+        self.assertEqual(spec.window_title_contains, "")
+        self.assertIn("chatgpt.exe", spec.exe_names)
+        self.assertEqual(spec.focus_method, "uia_composer")
+        self.assertEqual(spec.exe_path_contains, ("openai.codex",))
+        self.assertIs(spec.message_problem, sender.codex_message_problem)
+
+
+class CodexMessageProblemTests(unittest.TestCase):
+    """A leading '/' opens the Codex slash-command menu and '@' the mention
+    list; Enter would then pick a menu entry instead of sending."""
+
+    def test_plain_message_passes(self):
+        self.assertIsNone(sender.codex_message_problem("continue"))
+        self.assertIsNone(sender.codex_message_problem("go on, use a/b tests"))
+
+    def test_leading_slash_rejected(self):
+        self.assertTrue(sender.codex_message_problem("/compact"))
+        self.assertTrue(sender.codex_message_problem("  /model"))
+
+    def test_at_sign_rejected(self):
+        self.assertTrue(sender.codex_message_problem("look at @README.md"))
+
+    def test_gui_validation_applies_it_to_codex_only(self):
+        s = dict(gui.DEFAULTS)
+        s["target"] = "codex"
+        s["message"] = "/compact"
+        self.assertTrue(gui.validate_settings(s))
+        s["message"] = "mail me @home"
+        self.assertTrue(gui.validate_settings(s))
+        s["message"] = "continue"
+        self.assertIsNone(gui.validate_settings(s))
+        s["target"] = "claude"
+        s["message"] = "/compact"
+        self.assertIsNone(gui.validate_settings(s))
+
+
+class UiaBootstrapTests(unittest.TestCase):
+    """_uia() must survive a thread that some library already initialised
+    for the multi-threaded apartment (RPC_E_CHANGED_MODE): COM is usable
+    there, and treating it as 'unavailable' would switch every Codex guard
+    off for the rest of the GUI session."""
+
+    def _with_fake_comtypes(self, coinit_error):
+        fake = types.ModuleType("comtypes")
+        client = types.ModuleType("comtypes.client")
+
+        def coinit():
+            if coinit_error is not None:
+                raise coinit_error
+        fake.CoInitialize = coinit
+        fake.client = client
+        mod = types.SimpleNamespace(IUIAutomation=object())
+        client.GetModule = lambda _name: mod
+        client.CreateObject = lambda _clsid, interface=None: "uia-client"
+        with mock.patch.dict(sys.modules,
+                             {"comtypes": fake, "comtypes.client": client}):
+            return sender._uia(), mod
+
+    def test_changed_mode_is_tolerated(self):
+        err = OSError()
+        err.winerror = sender._RPC_E_CHANGED_MODE
+        result, mod = self._with_fake_comtypes(err)
+        self.assertEqual(result, ("uia-client", mod))
+
+    def test_other_com_failures_yield_none(self):
+        err = OSError()
+        err.winerror = -2147467259  # E_FAIL
+        result, _ = self._with_fake_comtypes(err)
+        self.assertIsNone(result)
+
+    def test_missing_comtypes_yields_none(self):
+        with mock.patch.dict(sys.modules, {"comtypes": None,
+                                           "comtypes.client": None}):
+            self.assertIsNone(sender._uia())
+
+
+class FindCodexComposerTests(unittest.TestCase):
+    """The Codex composer is the bottom-most ProseMirror edit element. Chromium
+    builds its accessibility tree lazily on first UIA contact, so an empty
+    FindAll result is retried before giving up."""
+
+    def test_picks_bottom_most_prosemirror_edit(self):
+        top_editor = _fake_element((40, 300, 900, 360))
+        composer = _fake_element((40, 1649, 986, 1713))
+        uia, mod = _fake_uia([[top_editor, composer]])
+        with mock.patch.object(sender, "time", mock.Mock()):
+            self.assertIs(sender._find_codex_composer(uia, mod, 42), composer)
+
+    def test_skips_empty_rectangles(self):
+        ghost = _fake_element((0, 0, 0, 0))
+        composer = _fake_element((40, 1649, 986, 1713))
+        uia, mod = _fake_uia([[composer, ghost]])
+        with mock.patch.object(sender, "time", mock.Mock()):
+            self.assertIs(sender._find_codex_composer(uia, mod, 42), composer)
+
+    def test_retries_while_tree_is_empty(self):
+        composer = _fake_element((40, 1649, 986, 1713))
+        uia, mod = _fake_uia([[], [composer]])
+        fake_time = mock.Mock()
+        with mock.patch.object(sender, "time", fake_time):
+            self.assertIs(sender._find_codex_composer(uia, mod, 42), composer)
+        fake_time.sleep.assert_called_once_with(
+            sender.CODEX_COMPOSER_FIND_DELAY_S)
+
+    def test_returns_none_after_attempt_budget(self):
+        uia, mod = _fake_uia([[]] * sender.CODEX_COMPOSER_FIND_ATTEMPTS)
+        with mock.patch.object(sender, "time", mock.Mock()):
+            self.assertIsNone(sender._find_codex_composer(uia, mod, 42))
+        root = uia.ElementFromHandle.return_value
+        self.assertEqual(root.FindAll.call_count,
+                         sender.CODEX_COMPOSER_FIND_ATTEMPTS)
+
+    def test_condition_uses_edit_type_and_prosemirror_class(self):
+        composer = _fake_element((40, 1649, 986, 1713))
+        uia, mod = _fake_uia([[composer]])
+        conditions = {}
+        uia.CreatePropertyCondition.side_effect = (
+            lambda pid, value: conditions.setdefault((pid, value), object()))
+        with mock.patch.object(sender, "time", mock.Mock()):
+            sender._find_codex_composer(uia, mod, 42)
+        # The two property conditions must be AND-ed, and that AND condition
+        # is what reaches FindAll — not just one of its ingredients.
+        uia.CreateAndCondition.assert_called_once_with(
+            conditions[(30003, 50004)], conditions[(30012, "ProseMirror")])
+        root = uia.ElementFromHandle.return_value
+        self.assertEqual(root.FindAll.call_args.args,
+                         (4, uia.CreateAndCondition.return_value))
+
+    def test_bottom_most_wins_even_when_not_last_in_tree_order(self):
+        # A ProseMirror editor in a dialog can come AFTER the composer in
+        # tree order; visual position decides, not enumeration order.
+        composer = _fake_element((40, 1649, 986, 1713))
+        dialog = _fake_element((300, 400, 700, 460))
+        uia, mod = _fake_uia([[composer, dialog]])
+        with mock.patch.object(sender, "time", mock.Mock()):
+            self.assertIs(sender._find_codex_composer(uia, mod, 42), composer)
+
+    def test_com_error_on_an_attempt_uses_the_retry_budget(self):
+        # A provider that is not ready yet raises rather than returning an
+        # empty array; that must count as "try again", not abort.
+        composer = _fake_element((40, 1649, 986, 1713))
+        uia, mod = _fake_uia([[composer]])
+        root = uia.ElementFromHandle.return_value
+        good = root.FindAll.side_effect
+        root.FindAll.side_effect = [OSError("UIA_E_ELEMENTNOTAVAILABLE"),
+                                    good(None, None)]
+        logs = []
+        with mock.patch.object(sender, "time", mock.Mock()):
+            self.assertIs(sender._find_codex_composer(uia, mod, 42,
+                                                      log=logs.append),
+                          composer)
+        self.assertTrue(any("attempt 1" in line for line in logs))
+
+    def test_element_that_vanishes_mid_scan_is_skipped(self):
+        ghost = _fake_element((0, 0, 10, 10))
+        type(ghost).CurrentBoundingRectangle = mock.PropertyMock(
+            side_effect=OSError("gone"))
+        composer = _fake_element((40, 1649, 986, 1713))
+        uia, mod = _fake_uia([[ghost, composer]])
+        with mock.patch.object(sender, "time", mock.Mock()):
+            self.assertIs(sender._find_codex_composer(uia, mod, 42), composer)
+
+
+class IsElementFocusedTests(unittest.TestCase):
+    def test_true_when_uia_says_same_element(self):
+        uia = mock.Mock()
+        uia.CompareElements.return_value = 1
+        self.assertTrue(sender._is_element_focused(
+            uia, _fake_element((0, 0, 1, 1))))
+
+    def test_true_when_focused_is_a_prosemirror_edit_at_the_same_rect(self):
+        # Fallback identity when CompareElements says no: same type, class
+        # AND bounding rectangle.
+        uia = mock.Mock()
+        uia.CompareElements.return_value = 0
+        uia.GetFocusedElement.return_value = _fake_element((41, 1649, 986, 1713))
+        self.assertTrue(sender._is_element_focused(
+            uia, _fake_element((41, 1649, 986, 1713))))
+
+    def test_false_for_a_prosemirror_edit_elsewhere(self):
+        # Another ProseMirror editor (rename dialog, notes) must not pass as
+        # the composer just because it shares type and class.
+        uia = mock.Mock()
+        uia.CompareElements.return_value = 0
+        uia.GetFocusedElement.return_value = _fake_element((300, 400, 700, 460))
+        self.assertFalse(sender._is_element_focused(
+            uia, _fake_element((41, 1649, 986, 1713))))
+
+    def test_false_for_other_elements(self):
+        uia = mock.Mock()
+        uia.CompareElements.return_value = 0
+        uia.GetFocusedElement.return_value = _fake_element(
+            (0, 0, 1, 1), cls="btn", ctype=50000)
+        self.assertFalse(sender._is_element_focused(
+            uia, _fake_element((0, 0, 1, 1))))
+
+    def test_false_when_element_itself_denies_keyboard_focus(self):
+        # Both signals must agree: the system-wide focused element AND the
+        # element's own HasKeyboardFocus flag (Chromium applies focus
+        # asynchronously; a window that failed to come to the foreground can
+        # disagree with itself).
+        uia = mock.Mock()
+        uia.CompareElements.return_value = 1
+        self.assertFalse(sender._is_element_focused(
+            uia, _fake_element((0, 0, 1, 1), has_focus=False)))
+
+    def test_false_when_uia_raises(self):
+        uia = mock.Mock()
+        uia.GetFocusedElement.side_effect = OSError("COM failure")
+        self.assertFalse(sender._is_element_focused(
+            uia, _fake_element((0, 0, 1, 1))))
+
+
+class WaitForFocusTests(unittest.TestCase):
+    def test_returns_immediately_on_first_success(self):
+        fake_time = mock.Mock()
+        with mock.patch.object(sender, "time", fake_time), \
+             mock.patch.object(sender, "_is_element_focused",
+                               return_value=True):
+            self.assertTrue(sender._wait_for_focus(mock.Mock(), mock.Mock()))
+        fake_time.sleep.assert_not_called()
+
+    def test_polls_then_gives_up(self):
+        fake_time = mock.Mock()
+        with mock.patch.object(sender, "time", fake_time), \
+             mock.patch.object(sender, "_is_element_focused",
+                               return_value=False) as check:
+            self.assertFalse(sender._wait_for_focus(mock.Mock(), mock.Mock()))
+        self.assertEqual(check.call_count, sender.CODEX_FOCUS_POLL_ATTEMPTS)
+        self.assertEqual(fake_time.sleep.call_count,
+                         sender.CODEX_FOCUS_POLL_ATTEMPTS - 1)
+
+    def test_late_focus_is_accepted(self):
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_is_element_focused",
+                               side_effect=[False, False, True]):
+            self.assertTrue(sender._wait_for_focus(mock.Mock(), mock.Mock()))
+
+
+class ComposerTextTests(unittest.TestCase):
+    def test_reads_value_pattern(self):
+        self.assertEqual(sender._composer_text(_fake_handle("hello")), "hello")
+
+    def test_null_value_is_unreadable_not_the_word_none(self):
+        # comtypes maps a NULL BSTR to None; str(None) would invent a draft
+        # called 'None'.
+        self.assertIsNone(sender._composer_text(_fake_handle(None)))
+        self.assertIsNone(sender._composer_draft(_fake_handle(None)))
+
+    def test_none_when_pattern_unavailable(self):
+        # comtypes never returns None from GetCurrentPattern; a falsy
+        # pointer is the "unsupported" signal.
+        self.assertIsNone(
+            sender._composer_text(_fake_handle(pattern_available=False)))
+
+    def test_none_when_uia_raises(self):
+        handle = _fake_handle()
+        handle.element.GetCurrentPattern.side_effect = OSError("COM failure")
+        self.assertIsNone(sender._composer_text(handle))
+
+
+class ComposerDraftTests(unittest.TestCase):
+    """The empty composer reports its placeholder through the Value pattern;
+    the placeholder equals the element's accessible name."""
+
+    def _handle(self, value, name="Do anything"):
+        handle = _fake_handle(value)
+        handle.element.CurrentName = name
+        return handle
+
+    def test_placeholder_means_empty(self):
+        self.assertEqual(sender._composer_draft(self._handle("\nDo anything")),
+                         "")
+        self.assertEqual(sender._composer_draft(self._handle("   ")), "")
+
+    def test_real_text_is_reported(self):
+        self.assertEqual(sender._composer_draft(self._handle("\nhalf a thought")),
+                         "half a thought")
+
+    def test_unreadable_is_none(self):
+        self.assertIsNone(sender._composer_draft(
+            _fake_handle(pattern_available=False)))
+
+
+class VerifyTypedTextTests(unittest.TestCase):
+    """Assert the effect of typing: the composer must contain the message
+    before Enter is pressed."""
+
+    def test_passes_when_text_contains_message(self):
+        fake_time = mock.Mock()
+        with mock.patch.object(sender, "time", fake_time):
+            sender._verify_typed_text(_fake_handle("draft continue"),
+                                      "continue", log=lambda _t: None)
+        fake_time.sleep.assert_not_called()
+
+    def test_accepts_late_value(self):
+        # The Value pattern can lag the keystrokes a little.
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_composer_text",
+                               side_effect=["\nDo anything", "continue"]):
+            sender._verify_typed_text(_fake_handle(), "continue",
+                                      log=lambda _t: None)
+
+    def test_raises_when_text_never_contains_message(self):
+        logs = []
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_composer_text",
+                               return_value="\nDo anything") as read:
+            with self.assertRaises(RuntimeError):
+                sender._verify_typed_text(_fake_handle(), "continue",
+                                          log=logs.append)
+        self.assertEqual(read.call_count, sender.CODEX_TEXT_POLL_ATTEMPTS)
+
+    def test_unreadable_text_warns_and_passes(self):
+        logs = []
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_composer_text", return_value=None):
+            sender._verify_typed_text(_fake_handle(), "continue",
+                                      log=logs.append)
+        self.assertTrue(any("WARN" in line for line in logs))
+
+    def test_readable_mismatch_stays_sticky_when_later_polls_are_unreadable(self):
+        # A readable mismatch is evidence the keystrokes never landed; a
+        # later unreadable poll must not launder it into "cannot verify".
+        logs = []
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_composer_text",
+                               side_effect=["\nDo anything", None, None]):
+            with self.assertRaises(RuntimeError):
+                sender._verify_typed_text(_fake_handle(), "continue",
+                                          log=logs.append)
+        self.assertFalse(any("WARN" in line for line in logs))
+
+    def test_placeholder_substring_does_not_satisfy_a_short_message(self):
+        # 'hi' is a substring of the placeholder 'Do anything'; the text
+        # must have CHANGED from what the box showed before typing.
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_composer_text",
+                               return_value="\nDo anything"):
+            with self.assertRaises(RuntimeError):
+                sender._verify_typed_text(_fake_handle(), "hi",
+                                          log=lambda _t: None,
+                                          baseline="\nDo anything")
+
+    def test_changed_text_containing_message_passes_with_baseline(self):
+        with mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_composer_text",
+                               return_value="\nhi"):
+            sender._verify_typed_text(_fake_handle(), "hi",
+                                      log=lambda _t: None,
+                                      baseline="\nDo anything")
+
+
+class FocusedControlTypeTests(unittest.TestCase):
+    def test_none_when_uia_unavailable(self):
+        with mock.patch.object(sender, "_uia", return_value=None):
+            self.assertIsNone(sender._focused_control_type())
+
+    def test_reads_type_from_focused_element(self):
+        uia = mock.Mock()
+        uia.GetFocusedElement.return_value.CurrentControlType = 50003
+        with mock.patch.object(sender, "_uia", return_value=(uia, object())):
+            self.assertEqual(sender._focused_control_type(), 50003)
+
+
+class CodexComposerFocusTests(unittest.TestCase):
+    """Codex desktop app: no safe focus shortcut exists (Shift+Esc = clear
+    unreads, Esc STOPS a running turn), so the composer is located via UIA,
+    focused with SetFocus, verified, and clicked as a fallback. Every failure
+    raises before anything is typed."""
+
+    RECT = (41, 1649, 986, 1713)
+
+    def _run(self, focused, composer="default", uia_available=True,
+             draft=""):
+        """`focused` feeds _wait_for_focus: one entry per focus attempt
+        (after SetFocus, after the click)."""
+        if composer == "default":
+            composer = _fake_element(self.RECT)
+        fake = mock.Mock()
+        logs = []
+        self.uia = mock.Mock(name="uia")
+        self.mod = types.SimpleNamespace(tag="mod")
+        handles = (self.uia, self.mod) if uia_available else None
+        with mock.patch.object(sender, "pyautogui", fake), \
+             mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_uia", return_value=handles), \
+             mock.patch.object(sender, "_find_codex_composer",
+                               return_value=composer), \
+             mock.patch.object(sender, "_wait_for_focus",
+                               side_effect=focused), \
+             mock.patch.object(sender, "_composer_draft",
+                               return_value=draft), \
+             mock.patch.object(sender, "get_window_rect",
+                               return_value=(0, 704, 1024, 1088)), \
+             mock.patch.object(sender, "_window_dpi_scale", return_value=1.25):
+            result = sender._focus_input(sender.TARGETS["codex"], 42,
+                                         "ChatGPT", log=logs.append)
+        return fake, composer, logs, result
+
+    def test_existing_draft_aborts_before_typing(self):
+        # Whatever is in the composer would be submitted together with the
+        # message; refuse rather than append to an unknown draft.
+        with self.assertRaises(RuntimeError):
+            self._run(focused=[True], draft="half a thought")
+
+    def test_unreadable_draft_warns_and_continues(self):
+        _, _, logs, result = self._run(focused=[True], draft=None)
+        self.assertTrue(any("WARN" in line for line in logs))
+        self.assertIsInstance(result, sender.ComposerHandle)
+
+    def test_setfocus_alone_when_verified(self):
+        fake, composer, _, result = self._run(focused=[True])
+        composer.SetFocus.assert_called_once_with()
+        fake.click.assert_not_called()
+        self.assertIsInstance(result, sender.ComposerHandle)
+        self.assertIs(result.element, composer)
+        # The handle must carry the very client/module it was built from:
+        # send_once re-checks focus and reads the text back through them.
+        self.assertIs(result.uia, self.uia)
+        self.assertIs(result.mod, self.mod)
+
+    def test_click_into_element_when_setfocus_does_not_take(self):
+        fake, composer, _, result = self._run(focused=[False, True])
+        composer.SetFocus.assert_called_once_with()
+        fake.click.assert_called_once_with((41 + 986) // 2, (1649 + 1713) // 2)
+        self.assertIs(result.element, composer)
+
+    def test_setfocus_exception_falls_back_to_click(self):
+        composer = _fake_element(self.RECT)
+        composer.SetFocus.side_effect = OSError("E_FAIL")
+        fake, _, _, _ = self._run(focused=[False, True], composer=composer)
+        fake.click.assert_called_once()
+
+    def test_raises_when_neither_setfocus_nor_click_focuses(self):
+        with self.assertRaises(RuntimeError):
+            self._run(focused=[False, False])
+
+    def test_raises_when_composer_not_found(self):
+        fake = mock.Mock()
+        with mock.patch.object(sender, "pyautogui", fake), \
+             mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_uia",
+                               return_value=(mock.Mock(), object())), \
+             mock.patch.object(sender, "_find_codex_composer",
+                               return_value=None):
+            with self.assertRaises(RuntimeError):
+                sender._focus_codex_composer(42, log=lambda _t: None)
+        fake.click.assert_not_called()
+
+    def test_without_uia_raises_and_never_clicks(self):
+        # This target's whole safety story is UIA-based: with UIA gone there
+        # is nothing to verify against, so no blind click and no typing.
+        fake = mock.Mock()
+        with mock.patch.object(sender, "pyautogui", fake), \
+             mock.patch.object(sender, "time", mock.Mock()), \
+             mock.patch.object(sender, "_uia", return_value=None):
+            with self.assertRaises(RuntimeError):
+                sender._focus_codex_composer(42, log=lambda _t: None)
+        fake.click.assert_not_called()
+
+
+class SendOnceCodexTests(unittest.TestCase):
+    def _send(self, focused_after_typing=50004, handle=None,
+              composer_texts=("\nDo anything", "continue"), foreground=True,
+              element_focused=True, message="continue"):
+        """Runs send_once("codex"); the fake pyautogui is kept on self.fake
+        so assertions still work when send_once raises. `composer_texts`
+        feeds _composer_text: the read before typing, then the read-backs."""
+        self.fake = mock.Mock()
+        texts = list(composer_texts)
+        reads = iter(texts)
+
+        def read(_handle):
+            try:
+                return next(reads)
+            except StopIteration:
+                return texts[-1]
+
+        with mock.patch.object(sender, "find_target_windows",
+                               return_value=[(42, "ChatGPT")]), \
+             mock.patch.object(sender, "_pick_main_window",
+                               return_value=(42, "ChatGPT")), \
+             mock.patch.object(sender, "force_activate_window",
+                               return_value=True), \
+             mock.patch.object(sender, "_focus_input",
+                               return_value=handle), \
+             mock.patch.object(sender, "_focused_control_type",
+                               return_value=focused_after_typing), \
+             mock.patch.object(sender, "_is_foreground",
+                               return_value=foreground), \
+             mock.patch.object(sender, "_is_element_focused",
+                               return_value=element_focused), \
+             mock.patch.object(sender, "_composer_text", side_effect=read), \
+             mock.patch.object(sender, "pyautogui", self.fake), \
+             mock.patch.object(sender, "time", mock.Mock()):
+            sender.send_once("codex", message, log=lambda _t: None)
+        return self.fake
+
+    def test_enter_pressed_when_composer_keeps_focus(self):
+        fake = self._send(focused_after_typing=50004)
+        fake.typewrite.assert_called_once()
+        fake.press.assert_called_once_with("enter")
+
+    def test_no_enter_when_focus_lost_after_typing(self):
+        with self.assertRaises(RuntimeError):
+            self._send(focused_after_typing=50000)
+        self.fake.typewrite.assert_called_once()
+        self.fake.press.assert_not_called()
+
+    def test_enter_pressed_when_read_back_shows_the_message(self):
+        fake = self._send(handle=_fake_handle(),
+                          composer_texts=("\nDo anything", "\ncontinue"))
+        fake.press.assert_called_once_with("enter")
+
+    def test_no_enter_when_read_back_lacks_message(self):
+        # The keystrokes went somewhere else (or were swallowed): the
+        # composer still shows only its placeholder. Fail closed.
+        with self.assertRaises(RuntimeError):
+            self._send(handle=_fake_handle(),
+                       composer_texts=("\nDo anything", "\nDo anything"))
+        self.fake.typewrite.assert_called_once()
+        self.fake.press.assert_not_called()
+
+    def test_no_enter_when_read_back_is_unchanged_for_short_message(self):
+        # 'hi' is inside the placeholder 'Do anything': an unchanged box is
+        # not proof of typing.
+        with self.assertRaises(RuntimeError):
+            self._send(handle=_fake_handle(), message="hi",
+                       composer_texts=("\nDo anything", "\nDo anything"))
+        self.fake.press.assert_not_called()
+
+    def test_no_enter_when_window_lost_foreground(self):
+        with self.assertRaises(RuntimeError):
+            self._send(handle=_fake_handle(), foreground=False)
+        self.fake.typewrite.assert_called_once()
+        self.fake.press.assert_not_called()
+
+    def test_no_enter_when_composer_element_lost_focus(self):
+        # Checked against the very element that was focused, not just "some
+        # text control somewhere on the desktop".
+        with self.assertRaises(RuntimeError):
+            self._send(handle=_fake_handle(), element_focused=False)
+        self.fake.typewrite.assert_called_once()
+        self.fake.press.assert_not_called()
+
+    def test_slash_or_at_message_refused_before_typing(self):
+        for message in ("/compact", "ask @codex"):
+            fake = mock.Mock()
+            with mock.patch.object(sender, "find_target_windows",
+                                   return_value=[(42, "ChatGPT")]), \
+                 mock.patch.object(sender, "_pick_main_window",
+                                   return_value=(42, "ChatGPT")), \
+                 mock.patch.object(sender, "force_activate_window",
+                                   return_value=True) as activate, \
+                 mock.patch.object(sender, "pyautogui", fake), \
+                 mock.patch.object(sender, "time", mock.Mock()):
+                with self.assertRaises(RuntimeError):
+                    sender.send_once("codex", message, log=lambda _t: None)
+            activate.assert_not_called()
+            fake.typewrite.assert_not_called()
+            fake.press.assert_not_called()
+
+    def test_prefer_largest_is_passed_to_window_picker(self):
+        fake = mock.Mock()
+        with mock.patch.object(sender, "find_target_windows",
+                               return_value=[(42, "ChatGPT")]), \
+             mock.patch.object(sender, "_pick_main_window",
+                               return_value=(42, "ChatGPT")) as pick, \
+             mock.patch.object(sender, "force_activate_window",
+                               return_value=True), \
+             mock.patch.object(sender, "_focus_input", return_value=None), \
+             mock.patch.object(sender, "_focused_control_type",
+                               return_value=50004), \
+             mock.patch.object(sender, "pyautogui", fake), \
+             mock.patch.object(sender, "time", mock.Mock()):
+            sender.send_once("codex", "continue", log=lambda _t: None)
+        pick.assert_called_once_with([(42, "ChatGPT")], prefer_largest=True)
+
+
+class GuiTargetChoicesTests(unittest.TestCase):
+    def test_every_sender_target_has_a_radio_button(self):
+        # The radio values are the TARGETS keys; a target without a button
+        # can only be selected by editing settings.json.
+        pairs = []
+        fake_ttk = mock.Mock()
+        fake_ttk.Radiobutton.side_effect = (
+            lambda *_a, **kw: pairs.append((kw.get("value"),
+                                            kw.get("variable")))
+            or mock.Mock())
+        with mock.patch.object(gui, "ttk", fake_ttk), \
+             mock.patch.object(gui, "tk", mock.Mock()):
+            g = object.__new__(gui.ContinueSenderGUI)
+            g.root = mock.Mock()
+            for name in ("target_var", "message_var", "initial_hours_var",
+                         "initial_minutes_var", "repeat_var", "every_hours_var",
+                         "every_minutes_var", "count_var"):
+                setattr(g, name, mock.Mock())
+            g._build_layout()
+        self.assertEqual(sorted(v for v, _ in pairs), sorted(sender.TARGETS))
+        # ...and every button drives the target variable (the classic slip
+        # when a third radio is cloned from the second).
+        self.assertTrue(all(var is g.target_var for _, var in pairs))
+
+
+class CliWrapperTests(unittest.TestCase):
+    """The three *_continue.py wrappers share cli.py; each must keep its
+    target and turn the flags into send_loop arguments unchanged."""
+
+    def _run(self, module, argv):
+        with mock.patch.object(sys, "argv", ["prog"] + argv), \
+             mock.patch.object(sender, "send_loop") as loop:
+            module.main()
+        return loop
+
+    def test_codex_wrapper_forwards_all_flags(self):
+        loop = self._run(codex_continue, [
+            "--minutes", "30", "--every-hours", "2", "--count", "3",
+            "--message", "go on"])
+        loop.assert_called_once_with(target="codex", message="go on",
+                                     initial_delay_s=1800.0, every_s=7200.0,
+                                     count=3)
+
+    def test_no_repeat_passes_none_interval(self):
+        loop = self._run(codex_continue, ["--hours", "1"])
+        loop.assert_called_once_with(target="codex", message="continue",
+                                     initial_delay_s=3600.0, every_s=None,
+                                     count=0)
+
+    def test_other_wrappers_keep_their_targets(self):
+        self.assertEqual(
+            self._run(claude_continue, []).call_args.kwargs["target"],
+            "claude")
+        self.assertEqual(
+            self._run(antigravity_continue, []).call_args.kwargs["target"],
+            "antigravity")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Tkinter control panel for claude_continue / antigravity_continue.
+"""Tkinter control panel for claude_continue / antigravity_continue / codex_continue.
 
 Drives sender.send_loop in a background thread. Communicates with the Tk main
 loop through a queue.Queue polled every 100 ms.
@@ -93,6 +93,11 @@ def validate_settings(settings: dict) -> str | None:
             f"Message contains characters that cannot be typed and would be "
             f"silently dropped: {bad!r}. Use plain ASCII text."
         )
+    spec = sender.TARGETS[settings["target"]]
+    if spec.message_problem is not None:
+        problem = spec.message_problem(settings["message"])
+        if problem:
+            return f"Message {problem}."
     numbers = (
         settings["initial_hours"], settings["initial_minutes"],
         settings["every_hours"], settings["every_minutes"],
@@ -150,6 +155,9 @@ class ContinueSenderGUI:
                         ).pack(side="left", padx=8, pady=4)
         ttk.Radiobutton(frame_target, text="Antigravity IDE",
                         variable=self.target_var, value="antigravity"
+                        ).pack(side="left", padx=8, pady=4)
+        ttk.Radiobutton(frame_target, text="Codex",
+                        variable=self.target_var, value="codex"
                         ).pack(side="left", padx=8, pady=4)
 
         # Message
