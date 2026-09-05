@@ -1,4 +1,5 @@
-"""Tkinter control panel for claude_continue / antigravity_continue / codex_continue.
+"""Tkinter control panel for claude_continue / antigravity_continue /
+codex_continue / zcode_continue.
 
 Drives sender.send_loop in a background thread. Communicates with the Tk main
 loop through a queue.Queue polled every 100 ms.
@@ -118,11 +119,22 @@ class ContinueSenderGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Continue Sender")
-        self.root.geometry("460x560")
+        # 34 px taller than the 460x580 this window used to be: the Target
+        # frame became a 2x2 grid (see _build_layout) and grew from 58 to
+        # 92 px. Everything above the log pane is packed at its requested
+        # height (520 px together, paddings included), the log pane takes
+        # what is left — 52 px of the 236 it wants at 580, 86 px at 614 —
+        # so without those 34 px back the log, where the sender's errors
+        # show up, drops from about three visible lines to one. (Measured
+        # with a withdrawn Tk root in a DPI-aware process at this machine's
+        # 125% scaling; the window is resizable, so this is a better
+        # starting size, not a guarantee.)
+        self.root.geometry("460x614")
 
         self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self.failed_total = 0  # failed sends in the current run
 
         settings, warning = load_settings()
 
@@ -147,18 +159,27 @@ class ContinueSenderGUI:
     def _build_layout(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        # Target
+        # Target. Two rows of two: measured with a withdrawn, DPI-aware Tk
+        # root (importing sender pulls in pyautogui, which makes the process
+        # DPI-aware — a measurement without it reports 96-dpi numbers and
+        # says the row fits), four buttons side by side request 462 px, more
+        # than the 444 px the 460 px window leaves between the outer
+        # paddings, so the ZCode label would be clipped. As a 2x2 grid the
+        # frame requests 292 px and fits — at the cost of 34 px of height,
+        # which the window geometry above pays back.
         frame_target = ttk.LabelFrame(self.root, text="Target")
         frame_target.pack(fill="x", **pad)
-        ttk.Radiobutton(frame_target, text="Claude Desktop",
-                        variable=self.target_var, value="claude"
-                        ).pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(frame_target, text="Antigravity IDE",
-                        variable=self.target_var, value="antigravity"
-                        ).pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(frame_target, text="Codex",
-                        variable=self.target_var, value="codex"
-                        ).pack(side="left", padx=8, pady=4)
+        self.target_frame = frame_target
+        for i, (label, value) in enumerate((
+            ("Claude Desktop", "claude"),
+            ("Antigravity IDE", "antigravity"),
+            ("Codex", "codex"),
+            ("ZCode", "zcode"),
+        )):
+            ttk.Radiobutton(frame_target, text=label,
+                            variable=self.target_var, value=value
+                            ).grid(row=i // 2, column=i % 2, sticky="w",
+                                   padx=8, pady=4)
 
         # Message
         frame_msg = ttk.LabelFrame(self.root, text="Message")
@@ -208,6 +229,8 @@ class ContinueSenderGUI:
         self.status_label.pack(anchor="w", padx=8, pady=2)
         self.sent_label = ttk.Label(frame_status, text="Sent: 0")
         self.sent_label.pack(anchor="w", padx=8, pady=2)
+        self.failed_label = ttk.Label(frame_status, text="Failed: 0")
+        self.failed_label.pack(anchor="w", padx=8, pady=2)
 
         # Buttons
         frame_btn = ttk.Frame(self.root)
@@ -290,6 +313,8 @@ class ContinueSenderGUI:
         self.stop_event.clear()
         self.status_label.configure(text="starting…")
         self.sent_label.configure(text="Sent: 0")
+        self.failed_total = 0
+        self.failed_label.configure(text="Failed: 0")
         self._set_inputs_enabled(False)
 
         def run() -> None:
@@ -342,6 +367,17 @@ class ContinueSenderGUI:
             n = event.get("n", 0)
             self.sent_label.configure(text=f"Sent: {n}")
             self._append_log(f"Sent #{n}")
+        elif t == "send_failed":
+            # A repeat run survived a failed send and will retry after the
+            # interval; the [ERROR]/[INFO] lines arrive as log events.
+            self.failed_total += 1
+            self.failed_label.configure(text=f"Failed: {self.failed_total}")
+            n = event.get("consecutive", 0)
+            limit = event.get("limit", "?")
+            self.status_label.configure(
+                text=f"send failed ({n}/{limit} in a row); retrying after "
+                     f"the interval"
+            )
         elif t == "log":
             self._append_log(event.get("text", ""))
         elif t == "done":

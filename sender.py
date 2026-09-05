@@ -1,7 +1,7 @@
 """Shared core for typing a message into a target Windows application.
 
-Used by claude_continue.py, antigravity_continue.py, codex_continue.py (via
-cli.py) and gui.py.
+Used by claude_continue.py, antigravity_continue.py, codex_continue.py,
+zcode_continue.py (via cli.py) and gui.py.
 """
 
 from __future__ import annotations
@@ -56,17 +56,80 @@ user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint]
 user32.GetAncestor.restype = ctypes.wintypes.HWND
 
 
+class ConfigurationError(ValueError):
+    """A send that no retry can rescue: an unknown target, a message that
+    typing would corrupt, or one the target's own rules refuse. send_loop
+    ends a run at once on these; every other send_once error is treated as
+    momentary in a repeat run (see send_loop)."""
+
+
+def _slash_at_problem(message: str, app: str, at_menu: str) -> Optional[str]:
+    """Shared rule for composers that open a menu on '/' and on '@': the
+    keystroke opens a pop-up list, so the Enter that should send the message
+    picks a list entry instead. Returns the reason to refuse, or None."""
+    if message.lstrip().startswith("/"):
+        return (f"starts with '/' (opens the {app} slash-command menu; Enter "
+                f"would run a command instead of sending)")
+    if "@" in message:
+        return (f"contains '@' (opens the {app} {at_menu}; Enter would pick "
+                f"an entry from it instead of sending)")
+    return None
+
+
 def codex_message_problem(message: str) -> Optional[str]:
     """Why `message` must not be typed into the Codex composer, or None.
     A leading '/' opens the slash-command menu and '@' opens the mention
-    list, so Enter would pick a menu entry instead of sending the text."""
-    if message.lstrip().startswith("/"):
-        return ("starts with '/' (opens the Codex slash-command menu; Enter "
-                "would run a command instead of sending)")
-    if "@" in message:
-        return ("contains '@' (opens the Codex mention list; Enter would "
-                "pick a mention instead of sending)")
-    return None
+    list."""
+    return _slash_at_problem(message, "Codex", "mention list")
+
+
+def zcode_message_problem(message: str) -> Optional[str]:
+    """Why `message` must not be typed into the ZCode composer, or None.
+    The composer's own placeholder advertises both menus ("@ to add context,
+    / for commands or capabilities"), and the app bundle ships the
+    slash-command list (chat.slash.* strings)."""
+    return _slash_at_problem(message, "ZCode", "context picker")
+
+
+# UIA control types that accept typed text. Chromium exposes the Antigravity
+# chat input as a ComboBox (50003); Edit (50004) and Document (50030) cover
+# ordinary inputs and rich-text editors.
+UIA_TEXT_ENTRY_TYPES = frozenset({50003, 50004, 50030})
+
+# The composer of a "uia_composer" target, as seen by UI Automation: an Edit
+# element, optionally pinned to a ClassName (TargetSpec.composer_class). It is
+# the bottom-most such element in the window — the button row below it holds
+# buttons and combo boxes, never an editor.
+UIA_EDIT_CONTROL_TYPE = 50004
+# Codex uses the ProseMirror editor and exposes its root class; ZCode uses
+# Lexical and exposes a run of Tailwind utility classes instead, so it pins no
+# class (composer_class=None) and relies on being the only Edit in the window.
+CODEX_COMPOSER_CLASS = "ProseMirror"
+# Chromium builds its accessibility tree lazily on first UIA contact; the
+# first FindAll after activation may legitimately come back empty. Measured on
+# ZCode: the first ElementFromHandle+FindAll saw 13 descendants and no Edit at
+# all, a later probe saw 266 and the composer. The budget only costs time on
+# the way to a failure — a successful find returns from the first attempt —
+# so it is generous.
+COMPOSER_FIND_ATTEMPTS = 6
+COMPOSER_FIND_DELAY_S = 1.0
+# Chromium applies a UIA focus request asynchronously, so the focus check is
+# polled briefly instead of read once.
+COMPOSER_FOCUS_POLL_ATTEMPTS = 5
+COMPOSER_FOCUS_POLL_DELAY_S = 0.15
+# Same for the text read-back after typing (the Value pattern lags a little).
+COMPOSER_TEXT_POLL_ATTEMPTS = 3
+COMPOSER_TEXT_POLL_DELAY_S = 0.2
+
+# Former names of the budgets above, from when Codex was the only
+# uia_composer target. Kept so external callers and tests keep working; the
+# budgets are shared by every uia_composer target.
+CODEX_COMPOSER_FIND_ATTEMPTS = COMPOSER_FIND_ATTEMPTS
+CODEX_COMPOSER_FIND_DELAY_S = COMPOSER_FIND_DELAY_S
+CODEX_FOCUS_POLL_ATTEMPTS = COMPOSER_FOCUS_POLL_ATTEMPTS
+CODEX_FOCUS_POLL_DELAY_S = COMPOSER_FOCUS_POLL_DELAY_S
+CODEX_TEXT_POLL_ATTEMPTS = COMPOSER_TEXT_POLL_ATTEMPTS
+CODEX_TEXT_POLL_DELAY_S = COMPOSER_TEXT_POLL_DELAY_S
 
 
 @dataclass(frozen=True)
@@ -86,6 +149,12 @@ class TargetSpec:
     # Target-specific message validation: returns a reason to refuse the
     # message, or None. Checked by the GUI up front and by send_once.
     message_problem: Optional[Callable[[str], Optional[str]]] = None
+    # focus_method "uia_composer" only: the UIA ClassName the composer Edit
+    # element must have. None accepts ANY Edit element in the window — the
+    # right choice when the app's class attribute is not a stable identifier
+    # (ZCode's is a run of Tailwind utility classes) and the window holds no
+    # other Edit. See _find_composer.
+    composer_class: Optional[str] = None
 
 
 TARGETS: dict[str, TargetSpec] = {
@@ -121,34 +190,48 @@ TARGETS: dict[str, TargetSpec] = {
         prefer_largest_window=True,
         exe_path_contains=("openai.codex",),
         message_problem=codex_message_problem,
+        composer_class=CODEX_COMPOSER_CLASS,
+    ),
+    # ZCode, Zhipu's GLM coding agent desktop app: an Electron app (not a VS
+    # Code fork) installed at C:\Program Files\ZCode\ZCode.exe, process image
+    # zcode.exe. Its window title is "ZCode", which would also match an
+    # Explorer folder or a browser tab while the app is closed, so matching is
+    # exe-only — there is no MSIX package and no same-named legacy exe, so no
+    # exe_path_contains is needed. Which window is picked is decided by
+    # find_target_windows (visible and unowned only) and the 200x200 minimum
+    # in _pick_main_window, NOT by prefer_largest_window: besides the main
+    # window the process owns an invisible 588x102 pop-up, several 0x0
+    # helpers and a hidden 3840x1550 Chromium helper that is *larger* than
+    # the main window. All of them are invisible, so none is a candidate and
+    # today exactly one window survives the filter. prefer_largest_window is
+    # therefore inert here; it is kept for the day a second full-size window
+    # shows up, and it would pick the wrong one if that hidden helper ever
+    # became visible — `python debug_windows.py zcode` lists every candidate,
+    # so check it after an app update.
+    # The composer is a Lexical contenteditable whose UIA ClassName is a run
+    # of Tailwind utility classes (not a stable identifier) and whose Name is
+    # the placeholder, which changes with the app's state — so it pins no
+    # class and is found as the bottom-most (and in fact only) Edit element
+    # in the window.
+    "zcode": TargetSpec(
+        name="ZCode",
+        window_title_contains="",
+        exe_names=("zcode.exe",),
+        focus_method="uia_composer",
+        blocklist=(),
+        prefer_largest_window=True,
+        message_problem=zcode_message_problem,
+        composer_class=None,
     ),
 }
-
-# UIA control types that accept typed text. Chromium exposes the Antigravity
-# chat input as a ComboBox (50003); Edit (50004) and Document (50030) cover
-# ordinary inputs and rich-text editors.
-UIA_TEXT_ENTRY_TYPES = frozenset({50003, 50004, 50030})
-
-# The Codex desktop app composer, as seen by UI Automation: an Edit element
-# whose class is the ProseMirror editor root. It is the bottom-most such
-# element in the window (the button row below it holds no editors).
-UIA_EDIT_CONTROL_TYPE = 50004
-CODEX_COMPOSER_CLASS = "ProseMirror"
-# Chromium builds its accessibility tree lazily on first UIA contact; the
-# first FindAll after activation may legitimately come back empty.
-CODEX_COMPOSER_FIND_ATTEMPTS = 4
-CODEX_COMPOSER_FIND_DELAY_S = 1.0
-# Chromium applies a UIA focus request asynchronously, so the focus check is
-# polled briefly instead of read once.
-CODEX_FOCUS_POLL_ATTEMPTS = 5
-CODEX_FOCUS_POLL_DELAY_S = 0.15
-# Same for the text read-back after typing (the Value pattern lags a little).
-CODEX_TEXT_POLL_ATTEMPTS = 3
-CODEX_TEXT_POLL_DELAY_S = 0.2
 
 # Focus methods that verify, via UIA, that a text element still holds focus
 # after typing and before Enter is pressed.
 _VERIFIED_FOCUS_METHODS = frozenset({"agent_input", "uia_composer"})
+
+# A repeat run (interval set) survives this many failed sends in a row
+# before send_loop gives up with done/error.
+MAX_CONSECUTIVE_FAILURES = 3
 
 # Click-fallback geometry for the Agent Manager chat input, measured from the
 # live window: the input box is anchored to the window bottom, its editable
@@ -191,8 +274,9 @@ def _get_process_name(hwnd) -> str:
 
 def _matches_spec(spec: TargetSpec, title: str, exe: str, path: str = "") -> bool:
     """Window (title, exe, image path) belongs to `spec`. Title matching is
-    opt-in: an empty window_title_contains means exe-only (see the codex
-    target). An exe match must also satisfy exe_path_contains when set."""
+    opt-in: an empty window_title_contains means exe-only (see the codex and
+    zcode targets). An exe match must also satisfy exe_path_contains when
+    set."""
     needle = spec.window_title_contains.lower()
     if needle and title and needle in title.lower():
         return True
@@ -393,21 +477,31 @@ def _element_rect(element) -> tuple[int, int, int, int]:
     return int(r.left), int(r.top), int(r.right), int(r.bottom)
 
 
-def _find_codex_composer(uia, mod, hwnd, log: Callable[[str], None] = None):
-    """Bottom-most ProseMirror edit element inside `hwnd`, or None.
+def _find_composer(uia, mod, hwnd, composer_class: Optional[str] = None,
+                   log: Callable[[str], None] = None):
+    """Bottom-most edit element inside `hwnd`, or None.
+
+    `composer_class` pins the UIA ClassName the element must have (Codex:
+    "ProseMirror"); None accepts any Edit element, which is what ZCode needs —
+    its composer class is a run of Tailwind utility classes that changes with
+    every restyling, and it is the only Edit in the window. Either way the
+    bottom-most candidate with a non-empty rectangle wins: the composer sits
+    at the window bottom, above a button row of buttons and combo boxes.
 
     A COM error during an attempt (provider not ready yet, element gone
     between two calls) counts like an empty result: it is logged and the
     next attempt runs — the retry budget exists exactly for that."""
-    condition = uia.CreateAndCondition(
-        uia.CreatePropertyCondition(mod.UIA_ControlTypePropertyId,
-                                    UIA_EDIT_CONTROL_TYPE),
-        uia.CreatePropertyCondition(mod.UIA_ClassNamePropertyId,
-                                    CODEX_COMPOSER_CLASS),
-    )
-    for attempt in range(CODEX_COMPOSER_FIND_ATTEMPTS):
+    condition = uia.CreatePropertyCondition(mod.UIA_ControlTypePropertyId,
+                                            UIA_EDIT_CONTROL_TYPE)
+    if composer_class:
+        condition = uia.CreateAndCondition(
+            condition,
+            uia.CreatePropertyCondition(mod.UIA_ClassNamePropertyId,
+                                        composer_class),
+        )
+    for attempt in range(COMPOSER_FIND_ATTEMPTS):
         if attempt:
-            time.sleep(CODEX_COMPOSER_FIND_DELAY_S)
+            time.sleep(COMPOSER_FIND_DELAY_S)
         try:
             root = uia.ElementFromHandle(hwnd)
             found = root.FindAll(mod.TreeScope_Descendants, condition)
@@ -432,21 +526,28 @@ def _find_codex_composer(uia, mod, hwnd, log: Callable[[str], None] = None):
     return None
 
 
+def _find_codex_composer(uia, mod, hwnd, log: Callable[[str], None] = None):
+    """The Codex composer: _find_composer pinned to the ProseMirror class."""
+    return _find_composer(uia, mod, hwnd, CODEX_COMPOSER_CLASS, log=log)
+
+
 def _is_element_focused(uia, element) -> bool:
     """True if `element` holds keyboard focus, judged by two independent
     signals that must both agree: the system-wide focused element is this
     one (UIA CompareElements, verified stable across queries in the Codex
-    app; as a guard against a version where it is not, a focused ProseMirror
-    edit at exactly the same bounding rectangle counts too — a different
-    editor never sits at the composer's bottom-anchored rectangle), and the
-    element itself reports HasKeyboardFocus. A window that could not become
-    foreground can mark its element focused internally while keystrokes
-    would land elsewhere; the system-wide check catches that."""
+    app; as a guard against a version where it is not, a focused edit of the
+    SAME class at exactly the same bounding rectangle counts too — a
+    different editor never sits at the composer's bottom-anchored
+    rectangle), and the element itself reports HasKeyboardFocus. A window
+    that could not become foreground can mark its element focused internally
+    while keystrokes would land elsewhere; the system-wide check catches
+    that."""
     try:
         focused = uia.GetFocusedElement()
         same = bool(uia.CompareElements(focused, element)) or (
             int(focused.CurrentControlType) == UIA_EDIT_CONTROL_TYPE
-            and (focused.CurrentClassName or "") == CODEX_COMPOSER_CLASS
+            and (focused.CurrentClassName or "")
+            == (element.CurrentClassName or "")
             and _element_rect(focused) == _element_rect(element)
         )
         return same and bool(element.CurrentHasKeyboardFocus)
@@ -457,9 +558,9 @@ def _is_element_focused(uia, element) -> bool:
 def _wait_for_focus(uia, element) -> bool:
     """Poll _is_element_focused: Chromium honours SetFocus/clicks a little
     after the call returns."""
-    for attempt in range(CODEX_FOCUS_POLL_ATTEMPTS):
+    for attempt in range(COMPOSER_FOCUS_POLL_ATTEMPTS):
         if attempt:
-            time.sleep(CODEX_FOCUS_POLL_DELAY_S)
+            time.sleep(COMPOSER_FOCUS_POLL_DELAY_S)
         if _is_element_focused(uia, element):
             return True
     return False
@@ -474,9 +575,10 @@ class ComposerHandle(NamedTuple):
 
 
 def _composer_text(handle: ComposerHandle) -> Optional[str]:
-    """Text the composer currently holds (UIA Value pattern; the empty
-    composer reports its placeholder). None when it cannot be read — that
-    means "cannot verify", not "empty"."""
+    """Text the composer currently holds (UIA Value pattern). What an EMPTY
+    composer reports differs per app: Codex echoes its placeholder, ZCode a
+    bare newline — _composer_draft maps both to "". None when the value
+    cannot be read — that means "cannot verify", not "empty"."""
     try:
         pattern = handle.element.GetCurrentPattern(handle.mod.UIA_ValuePatternId)
         if not pattern:
@@ -490,9 +592,11 @@ def _composer_text(handle: ComposerHandle) -> Optional[str]:
 
 
 def _composer_draft(handle: ComposerHandle) -> Optional[str]:
-    """Text already sitting in the composer: '' when it is empty (the Value
-    pattern then reports the placeholder, which equals the element's
-    accessible name), the draft otherwise, None when it cannot be read."""
+    """Text already sitting in the composer: '' when it is empty, the draft
+    otherwise, None when it cannot be read. Empty covers both observed
+    shapes — whitespace only (ZCode reports "\\n") and the placeholder echoed
+    back (Codex), recognised because it equals the element's accessible
+    name."""
     text = _composer_text(handle)
     if text is None:
         return None
@@ -512,15 +616,16 @@ def _verify_typed_text(
 ) -> None:
     """Assert the effect of typing, not the action: the composer's own text
     must contain `message` AND differ from `baseline` (the text read before
-    typing — the empty composer reports its placeholder, and a short message
-    such as 'hi' is a substring of 'Do anything'). Only a run in which no
-    poll could be read at all is "cannot verify" (a warning); any readable
-    mismatch aborts the send, whichever poll produced it."""
+    typing — an empty Codex composer reports its placeholder, and a short
+    message such as 'hi' is a substring of 'Do anything'; an empty ZCode
+    composer reports '\\n', so any typed text changes it). Only a run in
+    which no poll could be read at all is "cannot verify" (a warning); any
+    readable mismatch aborts the send, whichever poll produced it."""
     before = (baseline or "").strip()
     last_readable = None
-    for attempt in range(CODEX_TEXT_POLL_ATTEMPTS):
+    for attempt in range(COMPOSER_TEXT_POLL_ATTEMPTS):
         if attempt:
-            time.sleep(CODEX_TEXT_POLL_DELAY_S)
+            time.sleep(COMPOSER_TEXT_POLL_DELAY_S)
         text = _composer_text(handle)
         if text is None:
             continue
@@ -612,33 +717,37 @@ def _focus_ide_agent_panel(log: Callable[[str], None]) -> None:
         )
 
 
-def _focus_codex_composer(
-    hwnd, log: Callable[[str], None],
+def _focus_composer(
+    spec: TargetSpec, hwnd, log: Callable[[str], None],
 ) -> Optional[ComposerHandle]:
-    """Focus the composer of the Codex desktop app (ChatGPT.exe).
+    """Focus the composer of a "uia_composer" target (Codex, ZCode).
 
-    No keyboard shortcut is safe here: the app ships no default binding that
-    focuses the composer, Shift+Escape is 'clear all unreads', and plain
-    Escape STOPS a running turn before it would ever focus the composer. So
-    the composer is located through UI Automation (bottom-most ProseMirror
-    edit element), focused via UIA SetFocus and verified; a click into the
-    element is the fallback. Every failure — UIA unavailable, composer not
-    found, focus not taken, a draft already in the box — raises before
-    anything is typed. Returns the focused element so send_once can re-check
-    focus and read the typed text back before Enter."""
+    Neither app has a safe focus shortcut. Codex ships no default binding for
+    the composer, Shift+Escape is 'clear all unreads' and plain Escape STOPS
+    a running turn. ZCode's Electron menu offers only Ctrl+N / Ctrl+O /
+    Ctrl+W and the zoom accelerators — no composer binding, and Ctrl+W would
+    close the window. So the composer is located through UI Automation
+    (bottom-most Edit element, optionally pinned to spec.composer_class),
+    focused via UIA SetFocus and verified; a click into the element is the
+    fallback. Every failure — UIA unavailable, composer not found, focus not
+    taken, a draft already in the box — raises before anything is typed.
+    Returns the focused element so send_once can re-check focus and read the
+    typed text back before Enter."""
     handles = _uia()
     if handles is None:
         raise RuntimeError(
-            "UI Automation is unavailable (comtypes missing or COM failure); "
-            "refusing to type into the Codex composer unverified."
+            f"UI Automation is unavailable (comtypes missing or COM "
+            f"failure); refusing to type into the {spec.name} composer "
+            f"unverified."
         )
     uia, mod = handles
-    composer = _find_codex_composer(uia, mod, hwnd, log=log)
+    composer = _find_composer(uia, mod, hwnd, spec.composer_class, log=log)
     if composer is None:
+        what = (f"no {spec.composer_class} edit element"
+                if spec.composer_class else "no edit element")
         raise RuntimeError(
-            f"Could not find the Codex composer (no {CODEX_COMPOSER_CLASS} "
-            f"edit element in the window after "
-            f"{CODEX_COMPOSER_FIND_ATTEMPTS} attempts). Not typing."
+            f"Could not find the {spec.name} composer ({what} in the window "
+            f"after {COMPOSER_FIND_ATTEMPTS} attempts). Not typing."
         )
     try:
         composer.SetFocus()
@@ -652,8 +761,8 @@ def _focus_codex_composer(
         pyautogui.click(click_x, click_y)
         if not _wait_for_focus(uia, composer):
             raise RuntimeError(
-                "Could not focus the Codex composer (SetFocus and a click "
-                "both left focus elsewhere). Not typing."
+                f"Could not focus the {spec.name} composer (SetFocus and a "
+                f"click both left focus elsewhere). Not typing."
             )
 
     handle = ComposerHandle(uia, mod, composer)
@@ -663,10 +772,17 @@ def _focus_codex_composer(
             "draft is already there.")
     elif draft:
         raise RuntimeError(
-            f"The Codex composer already contains text ({draft!r}); not "
-            f"typing on top of a draft."
+            f"The {spec.name} composer already contains text ({draft!r}); "
+            f"not typing on top of a draft."
         )
     return handle
+
+
+def _focus_codex_composer(
+    hwnd, log: Callable[[str], None],
+) -> Optional[ComposerHandle]:
+    """The Codex composer: _focus_composer for the codex target."""
+    return _focus_composer(TARGETS["codex"], hwnd, log)
 
 
 def _focus_input(
@@ -689,8 +805,8 @@ def _focus_input(
             _focus_agent_manager_input(hwnd, log)
         return None
     if spec.focus_method == "uia_composer":
-        return _focus_codex_composer(hwnd, log)
-    raise ValueError(f"Unknown focus_method: {spec.focus_method}")
+        return _focus_composer(spec, hwnd, log)
+    raise ConfigurationError(f"Unknown focus_method: {spec.focus_method}")
 
 
 def send_once(
@@ -699,7 +815,9 @@ def send_once(
     log: Callable[[str], None] = print,
 ) -> None:
     if target not in TARGETS:
-        raise ValueError(f"Unknown target: {target}. Choices: {list(TARGETS)}")
+        raise ConfigurationError(
+            f"Unknown target: {target}. Choices: {list(TARGETS)}"
+        )
     spec = TARGETS[target]
 
     windows = find_target_windows(spec)
@@ -726,14 +844,14 @@ def send_once(
 
     bad = unsupported_chars(message)
     if bad:
-        raise RuntimeError(
+        raise ConfigurationError(
             f"Message contains characters that typing would silently drop "
             f"or misinterpret: {bad!r}. Use plain single-line ASCII text."
         )
     if spec.message_problem is not None:
         problem = spec.message_problem(message)
         if problem:
-            raise RuntimeError(
+            raise ConfigurationError(
                 f"Message {problem}. Not typing it into {spec.name}."
             )
 
@@ -796,6 +914,33 @@ def _wake_screen() -> None:
     time.sleep(1.0)
 
 
+def _countdown_wait(
+    seconds: float, label: str, stop_event: threading.Event,
+    emit: Callable[[dict], None],
+) -> bool:
+    """Wait `seconds` in 1 s ticks, printing a countdown and emitting
+    status/countdown events. Returns False as soon as `stop_event` is set."""
+    if seconds <= 0:
+        return True
+    target_time = datetime.now() + timedelta(seconds=seconds)
+    emit({"type": "status", "text": f"{label} for {int(seconds)}s"})
+    while True:
+        if stop_event.is_set():
+            return False
+        remaining = (target_time - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return True
+        emit({"type": "countdown", "remaining_s": int(remaining)})
+        hours, rem = divmod(int(remaining), 3600)
+        minutes, secs = divmod(rem, 60)
+        print(
+            f"\r  {label}: {hours:02d}:{minutes:02d}:{secs:02d}  ",
+            end="",
+            flush=True,
+        )
+        time.sleep(1)
+
+
 def send_loop(
     target: str,
     message: str,
@@ -806,8 +951,20 @@ def send_loop(
     on_event: Optional[Callable[[dict], None]] = None,
 ) -> None:
     """Send `message` to `target` after `initial_delay_s`, then optionally
-    repeat every `every_s`. Stops after `count` sends (0 = infinite) or when
-    `stop_event` is set. Fires `on_event(dict)` for GUI hooks."""
+    repeat every `every_s`. Stops after `count` successful sends (0 =
+    infinite) or when `stop_event` is set. Fires `on_event(dict)` for GUI
+    hooks.
+
+    Failure policy. A single-shot run (no interval) ends at the first
+    failed send with done/error, as it always did. A repeat run (interval
+    set, whatever the count) is usually unattended, and most refusals
+    are momentary (a draft in the composer, focus stolen while typing, UI
+    Automation not answering, the app not running yet): the run logs the
+    error, emits a `send_failed` event, waits the interval and tries again,
+    and gives up with done/error only after MAX_CONSECUTIVE_FAILURES failed
+    sends in a row. Failed sends do not count towards `count`. A
+    ConfigurationError (unknown target, untypeable or refused message) can
+    never succeed on retry and ends any run at once."""
     stop_event = stop_event or threading.Event()
 
     def emit(event: dict) -> None:
@@ -819,27 +976,11 @@ def send_loop(
         emit({"type": "log", "text": text})
 
     def wait(seconds: float, label: str) -> bool:
-        if seconds <= 0:
-            return True
-        target_time = datetime.now() + timedelta(seconds=seconds)
-        emit({"type": "status", "text": f"{label} for {int(seconds)}s"})
-        while True:
-            if stop_event.is_set():
-                return False
-            remaining = (target_time - datetime.now()).total_seconds()
-            if remaining <= 0:
-                return True
-            emit({"type": "countdown", "remaining_s": int(remaining)})
-            hours, rem = divmod(int(remaining), 3600)
-            minutes, secs = divmod(rem, 60)
-            print(
-                f"\r  {label}: {hours:02d}:{minutes:02d}:{secs:02d}  ",
-                end="",
-                flush=True,
-            )
-            time.sleep(1)
+        return _countdown_wait(seconds, label, stop_event, emit)
 
+    repeat_run = every_s is not None and every_s > 0
     sent = 0
+    failures = 0  # failed sends in a row; a success resets it
     try:
         if initial_delay_s > 0:
             log(f"[INFO] Initial delay: {initial_delay_s / 60:.1f} minutes")
@@ -855,10 +996,33 @@ def send_loop(
             _wake_screen()
             try:
                 send_once(target, message, log=log)
-            except Exception as e:
+            except ConfigurationError as e:
                 log(f"[ERROR] {e}")
                 emit({"type": "done", "reason": "error"})
                 return
+            except Exception as e:
+                log(f"[ERROR] {e}")
+                if not repeat_run:
+                    emit({"type": "done", "reason": "error"})
+                    return
+                failures += 1
+                emit({"type": "send_failed", "error": str(e),
+                      "consecutive": failures,
+                      "limit": MAX_CONSECUTIVE_FAILURES})
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    log(f"[ERROR] {failures} sends failed in a row; "
+                        f"giving up.")
+                    emit({"type": "done", "reason": "error"})
+                    return
+                log(f"[INFO] Send failed ({failures}/"
+                    f"{MAX_CONSECUTIVE_FAILURES} in a row); trying again "
+                    f"at the next interval.")
+                if not wait(every_s, "Next send"):
+                    emit({"type": "done", "reason": "stopped"})
+                    return
+                print()
+                continue
+            failures = 0
             sent += 1
             emit({"type": "sent", "n": sent})
 
