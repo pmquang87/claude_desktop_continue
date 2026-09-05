@@ -106,11 +106,17 @@ Ctrl+C cancels a running CLI cleanly.
 - The **ZCode desktop app** (Zhipu's GLM coding agent; an Electron app at
   `C:\Program Files\ZCode\ZCode.exe`, process `zcode.exe`) is matched by exe
   name only — its window title is plain `ZCode`, which an Explorer folder or
-  a browser tab would carry just as well while the app is closed — and the
-  largest window wins, because the same process also owns a small pop-up
-  window. It has no focus shortcut either: the whole Electron menu is
-  `Ctrl+N`, `Ctrl+O`, `Ctrl+W` and the zoom accelerators, and **`Ctrl+W`
-  would close the window**, so the sender presses no key before the message.
+  a browser tab would carry just as well while the app is closed. Only
+  visible, unowned windows of at least 200x200 are considered, which today
+  leaves exactly the main window: the same process also owns an invisible
+  small pop-up, several 0x0 helpers and a hidden helper window that is
+  *larger* than the main window, and it is the visibility filter, not
+  "largest wins", that keeps the sender off them. It has no focus shortcut
+  either: the whole Electron menu is `Ctrl+N`, `Ctrl+O`, `Ctrl+W` and the
+  zoom accelerators, and **`Ctrl+W` would close the window**, so the sender
+  presses no shortcut for this target — the only key events before the
+  message are the modifier releases and the single `Alt` tap that
+  `force_activate_window` uses to let Windows change the foreground window.
   The composer is a Lexical editor found as the bottom-most `Edit` element in
   the window (in practice the only one) — deliberately *not* by class or
   name: the class is a run of Tailwind utility classes, and the name is the

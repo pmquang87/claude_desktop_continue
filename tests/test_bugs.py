@@ -1127,6 +1127,31 @@ class ZCodeMatchingTests(unittest.TestCase):
             found = sender.find_target_windows(sender.TARGETS["zcode"])
         self.assertEqual(found, [(2, "ZCode")])
 
+    def test_a_bigger_hidden_sibling_never_wins(self):
+        # zcode.exe also owns a HIDDEN, unowned 3840x1550 Chromium helper —
+        # larger than the 1706x2100 main window. The visibility filter, not
+        # prefer_largest_window, is what keeps the send off it: with the
+        # helper in the candidate list, largest-wins would pick the wrong
+        # window. End to end, enumeration plus pick.
+        windows = {
+            1: dict(title="", visible=0, owner=0),       # 3840x1550 helper
+            2: dict(title="ZCode", visible=1, owner=0),  # main window
+        }
+        rects = {1: (0, 0, 3840, 1550), 2: (1707, 0, 1706, 2100)}
+        stub = _stub_enum_user32(windows)
+        stub.IsIconic.return_value = 0
+        spec = sender.TARGETS["zcode"]
+        with mock.patch.object(sender, "user32", stub), \
+             mock.patch.object(sender, "get_window_rect",
+                               side_effect=lambda h: rects[h]), \
+             mock.patch.object(sender, "_get_process_path",
+                               return_value=self.ZCODE_PATH):
+            found = sender.find_target_windows(spec)
+            picked = sender._pick_main_window(
+                found, prefer_largest=spec.prefer_largest_window)
+        self.assertEqual(found, [(2, "ZCode")])
+        self.assertEqual(picked, (2, "ZCode"))
+
     def test_explorer_window_titled_zcode_is_not_found(self):
         windows = {1: dict(title="ZCode", visible=1, owner=0)}
         with mock.patch.object(sender, "user32", _stub_enum_user32(windows)), \
@@ -1342,14 +1367,17 @@ class FindComposerTests(unittest.TestCase):
     def test_retry_budget_covers_a_cold_chromium_tree(self):
         # Measured on ZCode: the first FindAll after ElementFromHandle saw 13
         # descendants and no Edit at all; a later probe saw 266 and the
-        # composer. The budget must survive more than one empty answer.
+        # composer. The budget was raised 4 -> 6 for exactly that, so the
+        # lookup must still find a composer that only shows up on the SIXTH
+        # answer — with the pre-ZCode budget of 4 this run gives up and the
+        # unattended send fails against a just-started app.
         composer = _fake_element(self.COMPOSER, cls=ZCODE_COMPOSER_CLASS)
-        uia, mod = _fake_filtering_uia([[], [], [], [composer]])
+        uia, mod = _fake_filtering_uia([[], [], [], [], [], [composer]])
         fake_time = mock.Mock()
         with mock.patch.object(sender, "time", fake_time):
             self.assertIs(sender._find_composer(uia, mod, 42), composer)
-        self.assertEqual(fake_time.sleep.call_count, 3)
-        self.assertGreaterEqual(sender.COMPOSER_FIND_ATTEMPTS, 4)
+        self.assertEqual(fake_time.sleep.call_count, 5)
+        self.assertGreaterEqual(sender.COMPOSER_FIND_ATTEMPTS, 6)
 
     def test_legacy_budget_names_still_point_at_the_shared_budgets(self):
         self.assertEqual(sender.CODEX_COMPOSER_FIND_ATTEMPTS,
@@ -1594,7 +1622,10 @@ class CodexComposerFocusTests(unittest.TestCase):
     The patched finder is `_find_composer`: the lookup was generalized when
     the ZCode target arrived, and the focus path now calls it with
     `spec.composer_class`. `_find_codex_composer` (the ProseMirror-pinned
-    wrapper) still exists and is covered by FindCodexComposerTests."""
+    wrapper) still exists and is covered by FindCodexComposerTests — but only
+    this class sees the class pin being FORWARDED, which is the link the
+    generalization introduced (see
+    test_finder_is_called_with_the_prosemirror_class)."""
 
     RECT = (41, 1649, 986, 1713)
 
@@ -1613,7 +1644,7 @@ class CodexComposerFocusTests(unittest.TestCase):
              mock.patch.object(sender, "time", mock.Mock()), \
              mock.patch.object(sender, "_uia", return_value=handles), \
              mock.patch.object(sender, "_find_composer",
-                               return_value=composer), \
+                               return_value=composer) as find, \
              mock.patch.object(sender, "_wait_for_focus",
                                side_effect=focused), \
              mock.patch.object(sender, "_composer_draft",
@@ -1623,7 +1654,7 @@ class CodexComposerFocusTests(unittest.TestCase):
              mock.patch.object(sender, "_window_dpi_scale", return_value=1.25):
             result = sender._focus_input(sender.TARGETS["codex"], 42,
                                          "ChatGPT", log=logs.append)
-        return fake, composer, logs, result
+        return fake, composer, logs, result, find
 
     def test_existing_draft_aborts_before_typing(self):
         # Whatever is in the composer would be submitted together with the
@@ -1632,12 +1663,25 @@ class CodexComposerFocusTests(unittest.TestCase):
             self._run(focused=[True], draft="half a thought")
 
     def test_unreadable_draft_warns_and_continues(self):
-        _, _, logs, result = self._run(focused=[True], draft=None)
+        _, _, logs, result, _find = self._run(focused=[True], draft=None)
         self.assertTrue(any("WARN" in line for line in logs))
         self.assertIsInstance(result, sender.ComposerHandle)
 
+    def test_finder_is_called_with_the_prosemirror_class(self):
+        # The mirror of ZCodeComposerFocusTests.
+        # test_finder_is_called_without_a_class_filter, and the ONLY test that
+        # sees the class pin on the path a real Codex send takes:
+        # _focus_composer -> _find_composer(..., spec.composer_class, ...).
+        # `_find_codex_composer` hard-codes the class itself, so the tests
+        # that go through it cannot notice the pin being dropped here — and
+        # dropping it makes the send accept ANY bottom-most Edit in the
+        # ChatGPT window, which every later check (focus, read-back) would
+        # then happily confirm, because they all read that same element.
+        *_rest, find = self._run(focused=[True])
+        self.assertEqual(find.call_args.args[3], sender.CODEX_COMPOSER_CLASS)
+
     def test_setfocus_alone_when_verified(self):
-        fake, composer, _, result = self._run(focused=[True])
+        fake, composer, _, result, _find = self._run(focused=[True])
         composer.SetFocus.assert_called_once_with()
         fake.click.assert_not_called()
         self.assertIsInstance(result, sender.ComposerHandle)
@@ -1648,7 +1692,7 @@ class CodexComposerFocusTests(unittest.TestCase):
         self.assertIs(result.mod, self.mod)
 
     def test_click_into_element_when_setfocus_does_not_take(self):
-        fake, composer, _, result = self._run(focused=[False, True])
+        fake, composer, _, result, _find = self._run(focused=[False, True])
         composer.SetFocus.assert_called_once_with()
         fake.click.assert_called_once_with((41 + 986) // 2, (1649 + 1713) // 2)
         self.assertIs(result.element, composer)
@@ -1656,7 +1700,8 @@ class CodexComposerFocusTests(unittest.TestCase):
     def test_setfocus_exception_falls_back_to_click(self):
         composer = _fake_element(self.RECT)
         composer.SetFocus.side_effect = OSError("E_FAIL")
-        fake, _, _, _ = self._run(focused=[False, True], composer=composer)
+        fake, _, _, _, _find = self._run(focused=[False, True],
+                                         composer=composer)
         fake.click.assert_called_once()
 
     def test_raises_when_neither_setfocus_nor_click_focuses(self):
@@ -1850,6 +1895,37 @@ class SendOnceZCodeTests(unittest.TestCase):
         fake = self._send(handle=self._handle())
         fake.typewrite.assert_called_once_with("continue", interval=0.05)
         fake.press.assert_called_once_with("enter")
+
+    def test_key_inventory_of_a_send_is_exactly_what_the_docs_claim(self):
+        # README and the design spec enumerate every key event a ZCode send
+        # produces, because Ctrl+W would CLOSE the window. Keep the list
+        # honest: the stuck-modifier releases, the single Alt tap
+        # force_activate_window needs to be allowed to change the foreground
+        # window (real function here, not the usual stub), the message,
+        # Enter. No hotkey, no Ctrl, no 'w'.
+        fake = mock.Mock()
+        u = _stub_user32(foreground_hwnd=42)
+        with mock.patch.object(sender, "find_target_windows",
+                               return_value=[(42, "ZCode")]), \
+             mock.patch.object(sender, "_pick_main_window",
+                               return_value=(42, "ZCode")), \
+             mock.patch.object(sender, "_get_process_path",
+                               return_value=r"c:\program files\zcode\zcode.exe"), \
+             mock.patch.object(sender, "user32", u), \
+             mock.patch.object(sender, "_focus_input", return_value=None), \
+             mock.patch.object(sender, "_focused_control_type",
+                               return_value=50004), \
+             mock.patch.object(sender, "pyautogui", fake), \
+             mock.patch.object(sender, "time", mock.Mock()):
+            sender.send_once("zcode", "continue", log=lambda _t: None)
+        self.assertEqual(fake.mock_calls, [
+            mock.call.keyUp("ctrl"), mock.call.keyUp("shift"),
+            mock.call.keyUp("alt"), mock.call.keyUp("win"),
+            mock.call.keyDown("alt"), mock.call.keyUp("alt"),
+            mock.call.typewrite("continue", interval=0.05),
+            mock.call.press("enter"),
+        ])
+        fake.hotkey.assert_not_called()
 
     def test_no_enter_when_the_box_still_reads_empty(self):
         # The keystrokes went somewhere else: the composer still reports the
@@ -2045,6 +2121,18 @@ class DebugWindowsTests(unittest.TestCase):
         # ...with the target's own (absent) class filter.
         self.assertIsNone(find.call_args.args[3])
 
+    def test_codex_composer_is_probed_with_its_class_filter(self):
+        # The diagnostic must ask the same question the real send asks, per
+        # target: pinned to ProseMirror for codex, unpinned for zcode. A
+        # probe that dropped the pin would report an element the send would
+        # never accept.
+        composer = _fake_element((41, 1649, 986, 1713))
+        composer.CurrentName = "Do anything"
+        composer.CurrentIsKeyboardFocusable = 1
+        text, find = self._main("codex", "ChatGPT", composer)
+        self.assertIn("Composer:", text)
+        self.assertEqual(find.call_args.args[3], sender.CODEX_COMPOSER_CLASS)
+
     def test_missing_composer_is_reported_not_crashed(self):
         text, _find = self._main("zcode", "ZCode", composer=None)
         self.assertIn("No edit element", text)
@@ -2061,15 +2149,19 @@ class DebugWindowsTests(unittest.TestCase):
 
 
 class GuiTargetChoicesTests(unittest.TestCase):
-    def test_every_sender_target_has_a_radio_button(self):
-        # The radio values are the TARGETS keys; a target without a button
-        # can only be selected by editing settings.json.
-        pairs = []
+    def _build(self):
+        """Build the layout against a fake ttk. Returns the GUI object and
+        the radio buttons as (value, variable, widget) triples — the widget
+        records how the button was placed."""
+        radios = []
         fake_ttk = mock.Mock()
-        fake_ttk.Radiobutton.side_effect = (
-            lambda *_a, **kw: pairs.append((kw.get("value"),
-                                            kw.get("variable")))
-            or mock.Mock())
+
+        def radiobutton(*_a, **kw):
+            widget = mock.Mock()
+            radios.append((kw.get("value"), kw.get("variable"), widget))
+            return widget
+
+        fake_ttk.Radiobutton.side_effect = radiobutton
         with mock.patch.object(gui, "ttk", fake_ttk), \
              mock.patch.object(gui, "tk", mock.Mock()):
             g = object.__new__(gui.ContinueSenderGUI)
@@ -2079,10 +2171,35 @@ class GuiTargetChoicesTests(unittest.TestCase):
                          "every_minutes_var", "count_var"):
                 setattr(g, name, mock.Mock())
             g._build_layout()
-        self.assertEqual(sorted(v for v, _ in pairs), sorted(sender.TARGETS))
+        return g, radios
+
+    def test_every_sender_target_has_a_radio_button(self):
+        # The radio values are the TARGETS keys; a target without a button
+        # can only be selected by editing settings.json.
+        g, radios = self._build()
+        self.assertEqual(sorted(v for v, _var, _w in radios),
+                         sorted(sender.TARGETS))
         # ...and every button drives the target variable (the classic slip
         # when a third radio is cloned from the second).
-        self.assertTrue(all(var is g.target_var for _, var in pairs))
+        self.assertTrue(all(var is g.target_var for _v, var, _w in radios))
+
+    def test_target_buttons_are_gridded_at_most_two_per_row(self):
+        # Four buttons in ONE row request 462 px, more than the 444 px the
+        # 460 px window leaves between the outer paddings (measured with a
+        # withdrawn, DPI-aware Tk root — a DPI-unaware measurement says they
+        # fit and is wrong), so the last button's label is clipped. Without
+        # this assertion the 2x2 grid can be packed back into one row with
+        # the whole suite staying green, because nothing else looks at how
+        # the buttons are placed.
+        _g, radios = self._build()
+        per_row: dict[object, int] = {}
+        for _value, _var, widget in radios:
+            widget.pack.assert_not_called()
+            widget.grid.assert_called_once()
+            row = widget.grid.call_args.kwargs["row"]
+            per_row[row] = per_row.get(row, 0) + 1
+        self.assertTrue(per_row)
+        self.assertLessEqual(max(per_row.values()), 2)
 
 
 class CliWrapperTests(unittest.TestCase):

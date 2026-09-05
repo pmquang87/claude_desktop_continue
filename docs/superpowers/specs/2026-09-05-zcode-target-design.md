@@ -103,10 +103,17 @@ New target:
   reports "not running". Unlike Codex, no `exe_path_contains` is needed:
   there is no MSIX package and no same-named foreign executable to tell
   apart, so the exe name alone identifies the app.
-- **Largest window wins.** The same process owns the invisible 588x102
-  pop-up and 0x0 helpers. `find_target_windows` already drops hidden and
-  owned windows, and `_pick_main_window(..., prefer_largest=True)` plus the
-  200x200 minimum makes the choice independent of Z-order.
+- **Visibility, not size, isolates the main window.** Besides the main
+  window the process owns the invisible 588x102 pop-up, 0x0 helpers and a
+  hidden, unowned **3840x1550** Chromium helper — *larger* than the
+  1706x2100 main window (see Evidence). `find_target_windows` drops hidden
+  and owned windows before any size is compared, and the 200x200 minimum in
+  `_pick_main_window` drops the pop-up, so exactly one candidate is left.
+  `prefer_largest=True` is therefore inert for ZCode today; it is set so a
+  second *visible* full-size window cannot win on Z-order alone — and if the
+  hidden 3840x1550 helper ever became visible, largest-wins would pick the
+  wrong window. `debug_windows.py zcode` lists every candidate, so that is
+  what to check after an app update.
 - **Message validation.** `zcode_message_problem` refuses a message whose
   first non-space character is `/` (slash-command menu) or that contains `@`
   (context picker): Enter would pick a menu entry instead of sending. Same
@@ -181,12 +188,24 @@ ZCode with no change.
 
 A fourth radio button **ZCode** (value `zcode`), and the Target row becomes a
 **2x2 grid**. Measured with a withdrawn Tk root
-(`root.withdraw()`; build; `update_idletasks()`): four buttons in one row
-request **462 px**, while the 460 px window leaves **444 px** between the
-outer paddings - the ZCode button would be clipped, i.e. a target nobody can
-click. As a 2x2 grid the frame requests **292 px** and fits, so the window
-geometry stays `460x580`. `validate_settings` needs no change: it already
-applies `spec.message_problem` generically, which now covers ZCode.
+(`root.withdraw()`; build; `update_idletasks()`) in a **DPI-aware** process -
+importing `sender` pulls in `pyautogui`, which sets DPI awareness; measuring
+without it reports 96-dpi numbers and wrongly says the row fits: four buttons
+in one row request **462 px**, while the 460 px window leaves **444 px**
+between the outer paddings - the ZCode label would be clipped.
+
+The grid buys that width with height, in a window that is already over-full
+(the whole layout requests 832x764 into a 460x580 window): the frame grows
+**58 -> 92 px**, and since every frame above the log pane is packed at its
+requested height - 520 px together - while the log pane (packed last,
+`expand=True`) takes the remainder, those 34 px come straight out of the log:
+**52 px of the 236 it asks for** instead of 86, i.e. from about three visible
+lines to one, in the pane where the sender's errors appear. So the window
+geometry grows with it, `460x580` -> **`460x614`**
+(the window is resizable, so this is a better starting size, not a
+guarantee - at a different display scaling the numbers differ).
+`validate_settings` needs no change: it already applies
+`spec.message_problem` generically, which now covers ZCode.
 
 ### CLI
 
@@ -257,7 +276,9 @@ All tests stay fully mocked - no mouse, no keyboard, no windows. New cases in
 - Exe-only matching: a window titled `ZCode` owned by `explorer.exe` /
   `chrome.exe` / PyCharm does not match; `zcode.exe` matches with and without
   an image path; `find_target_windows` end-to-end keeps only the visible
-  unowned main window.
+  unowned main window, and - enumeration plus `_pick_main_window` together -
+  the hidden 3840x1550 sibling never wins even though it is the largest
+  window of the process.
 - `_find_composer` with a **condition-honouring** UIA fake (`FindAll` really
   applies the condition it is handed, so the test proves the *query*, not
   only the pick): without a class filter only Edits are asked for and the
@@ -265,8 +286,10 @@ All tests stay fully mocked - no mouse, no keyboard, no windows. New cases in
   accepted; the bottom-most Edit wins; `_find_codex_composer` still AND-s the
   ProseMirror class and ignores a lower Edit of another class; a renamed
   class yields None (fail closed) instead of falling back to "any Edit".
-- The retry budget survives three empty answers in a row, and the legacy
-  `CODEX_*` budget names still equal the `COMPOSER_*` ones.
+- The retry budget survives **five** empty answers in a row - the composer
+  is only found on the sixth attempt, so a silent revert to the pre-ZCode
+  budget of 4 turns the test red instead of passing unnoticed - and the
+  legacy `CODEX_*` budget names still equal the `COMPOSER_*` ones.
 - `_is_element_focused`: the same-rect fallback matches on the element's own
   class and rejects a different class.
 - `_focus_composer` for zcode: no `hotkey`/`press` is ever issued, the finder
@@ -276,19 +299,48 @@ All tests stay fully mocked - no mouse, no keyboard, no windows. New cases in
   no Enter when the box still reads `"\n"`, when the control type changed,
   when the window lost the foreground, or when the element lost focus;
   `prefer_largest=True` is passed to the window picker; `_focus_input` gets
-  the zcode spec.
-- `debug_windows`: the composer is probed for `zcode` (with the class filter
-  absent) and its value printed, a missing composer is reported not crashed,
-  a non-composer target is not probed, an unknown key exits.
+  the zcode spec; and the **complete key inventory** of a send is asserted
+  against the list documented above (four modifier releases, the activation
+  `Alt` tap, the message, Enter - no `hotkey`, no `W`), with the real
+  `force_activate_window` in the path, so the docs cannot drift from the
+  code again.
+- `debug_windows`: the composer is probed for `zcode` (class filter absent)
+  and for `codex` (pinned to `ProseMirror`) and its value printed, a missing
+  composer is reported not crashed, a non-composer target is not probed, an
+  unknown key exits.
 - `zcode_continue.py` forwards all flags, and *every* `TARGETS` key has a CLI
   wrapper.
+- `gui.py`: every `TARGETS` key has a radio button driving `target_var`
+  (unchanged), and the four buttons are placed with `grid`, at most two per
+  row - a revert to a single packed row is the clipping regression the grid
+  exists to prevent, and it is invisible to a DPI-unaware measurement, so
+  placement is asserted instead of width.
 
-One existing test changed: `CodexComposerFocusTests` patched
-`sender._find_codex_composer`; the focus path now calls the generalized
-`sender._find_composer`, so the patch target moved. The Codex-specific
-behaviour it used to cover is still covered - by `FindCodexComposerTests`
-(unchanged) and by the new "codex finder still requires the ProseMirror
-class" case.
+Existing tests changed:
+
+- `CodexComposerFocusTests` patched `sender._find_codex_composer`; the focus
+  path now calls the generalized `sender._find_composer`, so the patch target
+  moved. Its `_run` helper now also returns that patch mock, and a new case
+  asserts the finder is called **with** `CODEX_COMPOSER_CLASS` - the mirror
+  of the zcode "called without a class filter" case. This is the only test on
+  the link the generalization introduced (`_focus_composer` forwarding
+  `spec.composer_class`): `_find_codex_composer` hard-codes the class itself,
+  so every test that goes through it stays green when the pin is dropped at
+  the call site, and a Codex send would then accept any bottom-most Edit in
+  the window - with the focus check and the read-back confirming it, since
+  both read that same element.
+- The retry-budget case, see above.
+- `GuiTargetChoicesTests` builds the layout through a shared helper that now
+  keeps each fake Radiobutton widget, so the placement assertion can look at
+  how it was gridded.
+
+Every guard here was checked by mutation on a scratch copy of the sources.
+Six mutations - dropping the class pin at the call site, reverting the budget
+to 4, packing the radios into one row, dropping the class filter in
+`debug_windows.py`, removing the activation `Alt` tap, and slipping a
+`Ctrl+W` into the send path - each turn exactly one test red. The first four
+left the suite green before these guards existed, which is why they were
+written.
 
 Live verification is limited to **read-only** probes: window enumeration, the
 `FindAll` query, and Value/pattern reads. No send was performed - the user's
@@ -308,10 +360,22 @@ ZCode is running a real task and a stray keystroke would land in it.
 
 - **A second Edit element appears.** Today there is exactly one. A future
   search box or rename dialog *below* the composer would win the bottom-most
-  rule. Mitigation: `debug_windows.py zcode` lists what UIA sees, and the
-  draft check plus the typed-text read-back mean a wrong element aborts the
-  send rather than typing into it. If it ever happens, pin
-  `composer_class` - the field exists for exactly that.
+  rule, and **the draft check and the read-back would not stop it.** Both
+  read `handle.element` - the element that was picked - so they answer "did
+  the keystrokes land where I aimed", never "did I aim at the composer". A
+  wrong element that already holds text does abort the send (`_composer_draft`
+  is non-empty, e.g. a pre-filled rename dialog); a wrong element that is
+  **empty and focusable** - a fresh search box - passes the draft check,
+  receives the message and gets Enter, and `send_once` still logs a
+  successful send. `_is_element_focused` cannot help either: it compares the
+  focused element against that same picked element.
+  The real controls are therefore: `debug_windows.py zcode`, which prints
+  the element UIA finds together with its value and computed draft, run
+  after a ZCode update; and pinning `composer_class` if a second Edit ever
+  shows up - the field exists for exactly that. A window-rectangle or
+  `IsOffscreen` filter would *not* close this hole: the hypothetical search
+  box sits inside the window and on screen (such a filter would only help
+  against the "scrolled out of view" risk below).
 - **Elements scrolled out of view keep real rectangles.** The dump shows
   history items at negative `y`. They are Buttons, not Edits, so the type
   filter excludes them - but an Edit scrolled *below* the viewport would beat
@@ -323,9 +387,19 @@ ZCode is running a real task and a stray keystroke would land in it.
   machine could still need more, and the failure is then a clear "could not
   find the ZCode composer", retried at the next interval by a repeat run.
 - **`Ctrl+W` is one keystroke away from closing the window.** The sender
-  never presses a modifier for this target: it releases stuck modifiers
-  *before* activation, focuses via UIA `SetFocus` (click as fallback), and
-  types plain ASCII plus Enter.
+  presses no *shortcut* for this target - it focuses via UIA `SetFocus`
+  (click as fallback) and types plain ASCII plus Enter - but it is not true
+  that it presses no key or no modifier. The complete key inventory of a
+  ZCode send is: the stuck-modifier releases (`keyUp` of ctrl/shift/alt/win),
+  then the single **`Alt` tap** (`keyDown`+`keyUp`) that
+  `force_activate_window` uses on *every* target to let Windows change the
+  foreground window, then the message, then Enter. That Alt tap also fires
+  when ZCode is already the foreground window, i.e. at every interval of a
+  repeat run. It is harmless here - the window has no menu bar for a bare
+  Alt to open (`GetMenu(hwnd)` is NULL and the UIA tree of the main window
+  contains no `Menu`, `MenuBar` or `MenuItem` element at all; the Electron
+  accelerators are an accelerator table, not a rendered menu bar) - and no
+  combination the sender ever presses contains `W`.
 - **Placeholder-as-name.** Because the name changes with state, nothing in
   the sender may key off it. `_composer_draft`'s
   "value equals the accessible name" branch (which exists for Codex) could in

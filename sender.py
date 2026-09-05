@@ -197,13 +197,22 @@ TARGETS: dict[str, TargetSpec] = {
     # zcode.exe. Its window title is "ZCode", which would also match an
     # Explorer folder or a browser tab while the app is closed, so matching is
     # exe-only — there is no MSIX package and no same-named legacy exe, so no
-    # exe_path_contains is needed. The same process owns an invisible 588x102
-    # pop-up window and several 0x0 helper windows besides the main window;
-    # the main one is the largest. The composer is a Lexical contenteditable
-    # whose UIA ClassName is a run of Tailwind utility classes (not a stable
-    # identifier) and whose Name is the placeholder, which changes with the
-    # app's state — so it pins no class and is found as the bottom-most (and
-    # in fact only) Edit element in the window.
+    # exe_path_contains is needed. Which window is picked is decided by
+    # find_target_windows (visible and unowned only) and the 200x200 minimum
+    # in _pick_main_window, NOT by prefer_largest_window: besides the main
+    # window the process owns an invisible 588x102 pop-up, several 0x0
+    # helpers and a hidden 3840x1550 Chromium helper that is *larger* than
+    # the main window. All of them are invisible, so none is a candidate and
+    # today exactly one window survives the filter. prefer_largest_window is
+    # therefore inert here; it is kept for the day a second full-size window
+    # shows up, and it would pick the wrong one if that hidden helper ever
+    # became visible — `python debug_windows.py zcode` lists every candidate,
+    # so check it after an app update.
+    # The composer is a Lexical contenteditable whose UIA ClassName is a run
+    # of Tailwind utility classes (not a stable identifier) and whose Name is
+    # the placeholder, which changes with the app's state — so it pins no
+    # class and is found as the bottom-most (and in fact only) Edit element
+    # in the window.
     "zcode": TargetSpec(
         name="ZCode",
         window_title_contains="",

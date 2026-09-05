@@ -119,7 +119,17 @@ class ContinueSenderGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Continue Sender")
-        self.root.geometry("460x580")
+        # 34 px taller than the 460x580 this window used to be: the Target
+        # frame became a 2x2 grid (see _build_layout) and grew from 58 to
+        # 92 px. Everything above the log pane is packed at its requested
+        # height (520 px together, paddings included), the log pane takes
+        # what is left — 52 px of the 236 it wants at 580, 86 px at 614 —
+        # so without those 34 px back the log, where the sender's errors
+        # show up, drops from about three visible lines to one. (Measured
+        # with a withdrawn Tk root in a DPI-aware process at this machine's
+        # 125% scaling; the window is resizable, so this is a better
+        # starting size, not a guarantee.)
+        self.root.geometry("460x614")
 
         self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -149,11 +159,14 @@ class ContinueSenderGUI:
     def _build_layout(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        # Target. Two rows of two: measured with a withdrawn Tk root, four
-        # buttons side by side request 462 px, more than the 444 px the
-        # 460 px window leaves between the outer paddings — the ZCode button
-        # would be clipped, i.e. a target nobody can select. As a 2x2 grid
-        # the frame requests 292 px and fits.
+        # Target. Two rows of two: measured with a withdrawn, DPI-aware Tk
+        # root (importing sender pulls in pyautogui, which makes the process
+        # DPI-aware — a measurement without it reports 96-dpi numbers and
+        # says the row fits), four buttons side by side request 462 px, more
+        # than the 444 px the 460 px window leaves between the outer
+        # paddings, so the ZCode label would be clipped. As a 2x2 grid the
+        # frame requests 292 px and fits — at the cost of 34 px of height,
+        # which the window geometry above pays back.
         frame_target = ttk.LabelFrame(self.root, text="Target")
         frame_target.pack(fill="x", **pad)
         self.target_frame = frame_target
