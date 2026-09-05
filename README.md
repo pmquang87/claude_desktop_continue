@@ -24,7 +24,8 @@ python gui.py
 ```
 
 Pick target, edit message, set initial delay, optionally enable repeat with
-an interval and a count. Start / Stop. Settings persist to `settings.json`
+an interval and a count. Start / Stop. The status pane counts the sent and
+the failed sends of the current run. Settings persist to `settings.json`
 next to `gui.py`.
 
 ### Claude Desktop CLI
@@ -104,8 +105,20 @@ Ctrl+C cancels a running CLI cleanly.
   send is aborted with an error instead of typing into whatever has focus.
 - Between repeats, the window is re-found from scratch — so closing and
   reopening the target app during a long run doesn't break the loop.
+- A **repeat run** (any run with an interval, whatever the count) is usually
+  unattended,
+  and most refusals are momentary: a draft sitting in the composer, focus
+  stolen while typing, UI Automation not answering, the app not running
+  yet. Such a run therefore logs the error, reports it to the GUI (`Failed`
+  counter, status line), waits the interval and tries again; failed sends
+  do not count towards the count. It gives up with an error only after 3
+  failed sends in a row (`MAX_CONSECUTIVE_FAILURES` in `sender.py`) — or at
+  once when retrying cannot help: an unknown target, a message that cannot
+  be typed, or one the target refuses (Codex `/` and `@`). A **single
+  send** (no interval) still stops at the first error.
 - Before every send, a tiny mouse movement wakes the display if it's asleep.
-  (A *locked* session cannot be typed into — the run stops with an error.)
+  (A *locked* session cannot be typed into — a single send stops with an
+  error; a repeat run retries at the next interval, see above.)
 
 ## Files
 

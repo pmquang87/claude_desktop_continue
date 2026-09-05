@@ -265,7 +265,10 @@ current Codex thread.
   choice. The Codex path has more refusal conditions (draft in the box,
   focus lost, read-back mismatch), so an unattended repeat run stops at the
   first one instead of trying again at the next interval. Changing that is
-  a separate decision for all targets.
+  a separate decision for all targets. *Decided the same day, see
+  `2026-09-05-send-loop-retry-design.md`: repeat runs now retry at the next
+  interval and give up after three failed sends in a row; configuration
+  errors and single sends still stop at once.*
 - **Exe rename or a non-MSIX install.** Covered by `codex.exe` in
   `exe_names`; a rename to something else, or an install outside a path
   containing `openai.codex`, means "not running" until the spec is updated

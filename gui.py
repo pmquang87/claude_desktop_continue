@@ -118,11 +118,12 @@ class ContinueSenderGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Continue Sender")
-        self.root.geometry("460x560")
+        self.root.geometry("460x580")
 
         self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self.failed_total = 0  # failed sends in the current run
 
         settings, warning = load_settings()
 
@@ -208,6 +209,8 @@ class ContinueSenderGUI:
         self.status_label.pack(anchor="w", padx=8, pady=2)
         self.sent_label = ttk.Label(frame_status, text="Sent: 0")
         self.sent_label.pack(anchor="w", padx=8, pady=2)
+        self.failed_label = ttk.Label(frame_status, text="Failed: 0")
+        self.failed_label.pack(anchor="w", padx=8, pady=2)
 
         # Buttons
         frame_btn = ttk.Frame(self.root)
@@ -290,6 +293,8 @@ class ContinueSenderGUI:
         self.stop_event.clear()
         self.status_label.configure(text="starting…")
         self.sent_label.configure(text="Sent: 0")
+        self.failed_total = 0
+        self.failed_label.configure(text="Failed: 0")
         self._set_inputs_enabled(False)
 
         def run() -> None:
@@ -342,6 +347,17 @@ class ContinueSenderGUI:
             n = event.get("n", 0)
             self.sent_label.configure(text=f"Sent: {n}")
             self._append_log(f"Sent #{n}")
+        elif t == "send_failed":
+            # A repeat run survived a failed send and will retry after the
+            # interval; the [ERROR]/[INFO] lines arrive as log events.
+            self.failed_total += 1
+            self.failed_label.configure(text=f"Failed: {self.failed_total}")
+            n = event.get("consecutive", 0)
+            limit = event.get("limit", "?")
+            self.status_label.configure(
+                text=f"send failed ({n}/{limit} in a row); retrying after "
+                     f"the interval"
+            )
         elif t == "log":
             self._append_log(event.get("text", ""))
         elif t == "done":

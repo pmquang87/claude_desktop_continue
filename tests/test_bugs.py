@@ -296,6 +296,185 @@ class SendLoopTests(unittest.TestCase):
         self.assertIn("sent", types)
         self.assertEqual(events[-1]["type"], "done")
 
+    # --- retry policy for unattended repeat runs ---------------------------
+
+    def _run(self, send_effects, every_s, count, events, waits):
+        """Runs send_loop with send_once following `send_effects` (None =
+        success, an exception = that failure) and the interval wait replaced
+        by an immediate return that records (seconds, label) in `waits`.
+        Returns the send_once mock."""
+
+        def fake_wait(seconds, label, stop_event, emit):
+            waits.append((seconds, label))
+            return True
+
+        with mock.patch.object(sender, "_wake_screen"), \
+             mock.patch.object(sender, "_countdown_wait",
+                               side_effect=fake_wait), \
+             mock.patch.object(sender, "send_once",
+                               side_effect=send_effects) as once, \
+             contextlib.redirect_stdout(io.StringIO()):
+            sender.send_loop(
+                target="claude", message="x", initial_delay_s=0,
+                every_s=every_s, count=count, on_event=events.append,
+            )
+        return once
+
+    @staticmethod
+    def _failed(events):
+        return [e for e in events if e["type"] == "send_failed"]
+
+    def test_transient_failure_then_success_continues_a_repeat_run(self):
+        # A draft in the composer / focus lost / read-back mismatch is often
+        # gone by the next interval: log it, report it, wait, try again.
+        events, waits = [], []
+        once = self._run(
+            [RuntimeError("composer holds a draft"), None, None],
+            every_s=60, count=2, events=events, waits=waits,
+        )
+        self.assertEqual(once.call_count, 3)
+        failed = self._failed(events)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["consecutive"], 1)
+        self.assertEqual(failed[0]["limit"], sender.MAX_CONSECUTIVE_FAILURES)
+        self.assertIn("draft", failed[0]["error"])
+        # Failed sends do not count towards `count`.
+        self.assertEqual([e["n"] for e in events if e["type"] == "sent"],
+                         [1, 2])
+        self.assertEqual(events[-1], {"type": "done",
+                                      "reason": "count_reached"})
+        # The failure waited a full interval before the retry, like a
+        # success would have.
+        self.assertEqual([w[0] for w in waits], [60, 60])
+        self.assertTrue(any(e["type"] == "log" and "[ERROR]" in e["text"]
+                            for e in events))
+
+    def test_consecutive_failures_end_a_repeat_run(self):
+        events, waits = [], []
+        limit = sender.MAX_CONSECUTIVE_FAILURES
+        once = self._run(
+            [RuntimeError("no window")] * (limit + 2),
+            every_s=60, count=0, events=events, waits=waits,
+        )
+        self.assertEqual(once.call_count, limit)
+        self.assertEqual([e["consecutive"] for e in self._failed(events)],
+                         list(range(1, limit + 1)))
+        self.assertEqual(events[-1], {"type": "done", "reason": "error"})
+        # No wait after the last, fatal failure.
+        self.assertEqual(len(waits), limit - 1)
+
+    def test_a_success_resets_the_failure_streak(self):
+        events, waits = [], []
+        limit = sender.MAX_CONSECUTIVE_FAILURES
+        streak = [RuntimeError("focus lost")] * (limit - 1)
+        once = self._run(
+            streak + [None] + streak + [None],
+            every_s=60, count=2, events=events, waits=waits,
+        )
+        self.assertEqual(once.call_count, 2 * limit)
+        self.assertEqual(events[-1], {"type": "done",
+                                      "reason": "count_reached"})
+        self.assertEqual(max(e["consecutive"] for e in self._failed(events)),
+                         limit - 1)
+
+    def test_configuration_error_ends_a_repeat_run_at_once(self):
+        # Unknown target, untypeable message, message the target refuses:
+        # retrying cannot help, so the run ends like before.
+        events, waits = [], []
+        once = self._run(
+            [sender.ConfigurationError("Message starts with '/'")],
+            every_s=60, count=0, events=events, waits=waits,
+        )
+        self.assertEqual(once.call_count, 1)
+        self.assertEqual(self._failed(events), [])
+        self.assertEqual(waits, [])
+        self.assertEqual(events[-1], {"type": "done", "reason": "error"})
+
+    def test_count_one_with_an_interval_retries_too(self):
+        # The interval is the retry cadence; count only limits successes.
+        events, waits = [], []
+        once = self._run(
+            [RuntimeError("no window"), None],
+            every_s=60, count=1, events=events, waits=waits,
+        )
+        self.assertEqual(once.call_count, 2)
+        self.assertEqual(len(self._failed(events)), 1)
+        self.assertEqual([w[0] for w in waits], [60])
+        self.assertEqual([e["n"] for e in events if e["type"] == "sent"], [1])
+        self.assertEqual(events[-1], {"type": "done",
+                                      "reason": "count_reached"})
+
+    def test_single_shot_failure_ends_at_once(self):
+        # No interval means nothing to wait for: fail immediately, whatever
+        # the count.
+        for every_s, count in ((None, 0), (None, 1), (None, 3)):
+            events, waits = [], []
+            once = self._run(
+                [RuntimeError("no window"), None],
+                every_s=every_s, count=count, events=events, waits=waits,
+            )
+            self.assertEqual(once.call_count, 1, (every_s, count))
+            self.assertEqual(self._failed(events), [], (every_s, count))
+            self.assertEqual(waits, [], (every_s, count))
+            self.assertEqual(events[-1], {"type": "done", "reason": "error"},
+                             (every_s, count))
+
+    def test_stop_during_the_retry_wait_ends_with_stopped(self):
+        events = []
+        with mock.patch.object(sender, "_wake_screen"), \
+             mock.patch.object(sender, "_countdown_wait",
+                               return_value=False), \
+             mock.patch.object(sender, "send_once",
+                               side_effect=[RuntimeError("x"), None]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            sender.send_loop(
+                target="claude", message="x", initial_delay_s=0,
+                every_s=60, count=0, on_event=events.append,
+            )
+        self.assertEqual(events[-1], {"type": "done", "reason": "stopped"})
+
+
+class ConfigurationErrorTests(unittest.TestCase):
+    """send_once must raise ConfigurationError (a ValueError) for every
+    condition that no retry can fix, so send_loop can tell them apart from
+    transient refusals."""
+
+    def test_is_a_value_error(self):
+        self.assertTrue(issubclass(sender.ConfigurationError, ValueError))
+
+    def test_unknown_target(self):
+        with self.assertRaises(sender.ConfigurationError):
+            sender.send_once("nope", "continue", log=lambda _t: None)
+
+    def _send(self, target, message):
+        fake = mock.Mock()
+        with mock.patch.object(sender, "find_target_windows",
+                               return_value=[(42, "Target")]), \
+             mock.patch.object(sender, "_pick_main_window",
+                               return_value=(42, "Target")), \
+             mock.patch.object(sender, "force_activate_window",
+                               return_value=True) as activate, \
+             mock.patch.object(sender, "pyautogui", fake), \
+             mock.patch.object(sender, "time", mock.Mock()):
+            with self.assertRaises(sender.ConfigurationError):
+                sender.send_once(target, message, log=lambda _t: None)
+        activate.assert_not_called()
+        fake.typewrite.assert_not_called()
+
+    def test_untypeable_message(self):
+        self._send("claude", "weiter pr\u00fcfen")
+
+    def test_message_the_target_refuses(self):
+        self._send("codex", "/compact")
+
+    def test_transient_refusals_stay_runtime_errors(self):
+        # Sanity: the "not running" refusal is NOT a configuration error.
+        with mock.patch.object(sender, "find_target_windows",
+                               return_value=[]):
+            with self.assertRaises(RuntimeError) as ctx:
+                sender.send_once("claude", "continue", log=lambda _t: None)
+        self.assertNotIsInstance(ctx.exception, sender.ConfigurationError)
+
 
 class LoadSettingsTests(unittest.TestCase):
     def test_valid_json_that_is_not_an_object_falls_back_to_defaults(self):
@@ -566,7 +745,7 @@ class SendOnceFocusSafetyTests(unittest.TestCase):
         patches = self._base_patches(fake, focused_types=[50003])
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
              patches[5], patches[6]:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(sender.ConfigurationError):
                 sender.send_once("antigravity", "weiter prüfen",
                                  log=lambda _t: None)
             fake.typewrite.assert_not_called()
@@ -610,6 +789,41 @@ class EventPumpTests(unittest.TestCase):
         except Exception:
             pass  # the raise may propagate; rescheduling must happen anyway
         g.root.after.assert_called_once()
+
+
+class SendFailedEventTests(unittest.TestCase):
+    def _gui(self):
+        g = object.__new__(gui.ContinueSenderGUI)
+        g.status_label = mock.Mock()
+        g.sent_label = mock.Mock()
+        g.failed_label = mock.Mock()
+        g.log_text = mock.Mock()
+        g.failed_total = 0
+        return g
+
+    @staticmethod
+    def _label_text(label):
+        return label.configure.call_args.kwargs["text"]
+
+    def test_send_failed_updates_status_and_failed_count(self):
+        g = self._gui()
+        g._handle_event({"type": "send_failed", "error": "draft in box",
+                         "consecutive": 1, "limit": 3})
+        g._handle_event({"type": "send_failed", "error": "draft in box",
+                         "consecutive": 2, "limit": 3})
+        self.assertEqual(g.failed_total, 2)
+        self.assertEqual(self._label_text(g.failed_label), "Failed: 2")
+        status = self._label_text(g.status_label)
+        self.assertIn("2/3", status)
+        self.assertIn("retry", status.lower())
+        # The run is still going: inputs stay disabled (no re-enable call).
+        self.assertFalse(hasattr(g, "start_btn"))
+
+    def test_send_failed_leaves_sent_count_alone(self):
+        g = self._gui()
+        g._handle_event({"type": "send_failed", "error": "x",
+                         "consecutive": 1, "limit": 3})
+        g.sent_label.configure.assert_not_called()
 
 
 class ExeOnlyMatchingTests(unittest.TestCase):
@@ -1285,7 +1499,7 @@ class SendOnceCodexTests(unittest.TestCase):
                                    return_value=True) as activate, \
                  mock.patch.object(sender, "pyautogui", fake), \
                  mock.patch.object(sender, "time", mock.Mock()):
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises(sender.ConfigurationError):
                     sender.send_once("codex", message, log=lambda _t: None)
             activate.assert_not_called()
             fake.typewrite.assert_not_called()

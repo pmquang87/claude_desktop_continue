@@ -56,6 +56,13 @@ user32.GetAncestor.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint]
 user32.GetAncestor.restype = ctypes.wintypes.HWND
 
 
+class ConfigurationError(ValueError):
+    """A send that no retry can rescue: an unknown target, a message that
+    typing would corrupt, or one the target's own rules refuse. send_loop
+    ends a run at once on these; every other send_once error is treated as
+    momentary in a repeat run (see send_loop)."""
+
+
 def codex_message_problem(message: str) -> Optional[str]:
     """Why `message` must not be typed into the Codex composer, or None.
     A leading '/' opens the slash-command menu and '@' opens the mention
@@ -149,6 +156,10 @@ CODEX_TEXT_POLL_DELAY_S = 0.2
 # Focus methods that verify, via UIA, that a text element still holds focus
 # after typing and before Enter is pressed.
 _VERIFIED_FOCUS_METHODS = frozenset({"agent_input", "uia_composer"})
+
+# A repeat run (interval set) survives this many failed sends in a row
+# before send_loop gives up with done/error.
+MAX_CONSECUTIVE_FAILURES = 3
 
 # Click-fallback geometry for the Agent Manager chat input, measured from the
 # live window: the input box is anchored to the window bottom, its editable
@@ -690,7 +701,7 @@ def _focus_input(
         return None
     if spec.focus_method == "uia_composer":
         return _focus_codex_composer(hwnd, log)
-    raise ValueError(f"Unknown focus_method: {spec.focus_method}")
+    raise ConfigurationError(f"Unknown focus_method: {spec.focus_method}")
 
 
 def send_once(
@@ -699,7 +710,9 @@ def send_once(
     log: Callable[[str], None] = print,
 ) -> None:
     if target not in TARGETS:
-        raise ValueError(f"Unknown target: {target}. Choices: {list(TARGETS)}")
+        raise ConfigurationError(
+            f"Unknown target: {target}. Choices: {list(TARGETS)}"
+        )
     spec = TARGETS[target]
 
     windows = find_target_windows(spec)
@@ -726,14 +739,14 @@ def send_once(
 
     bad = unsupported_chars(message)
     if bad:
-        raise RuntimeError(
+        raise ConfigurationError(
             f"Message contains characters that typing would silently drop "
             f"or misinterpret: {bad!r}. Use plain single-line ASCII text."
         )
     if spec.message_problem is not None:
         problem = spec.message_problem(message)
         if problem:
-            raise RuntimeError(
+            raise ConfigurationError(
                 f"Message {problem}. Not typing it into {spec.name}."
             )
 
@@ -796,6 +809,33 @@ def _wake_screen() -> None:
     time.sleep(1.0)
 
 
+def _countdown_wait(
+    seconds: float, label: str, stop_event: threading.Event,
+    emit: Callable[[dict], None],
+) -> bool:
+    """Wait `seconds` in 1 s ticks, printing a countdown and emitting
+    status/countdown events. Returns False as soon as `stop_event` is set."""
+    if seconds <= 0:
+        return True
+    target_time = datetime.now() + timedelta(seconds=seconds)
+    emit({"type": "status", "text": f"{label} for {int(seconds)}s"})
+    while True:
+        if stop_event.is_set():
+            return False
+        remaining = (target_time - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return True
+        emit({"type": "countdown", "remaining_s": int(remaining)})
+        hours, rem = divmod(int(remaining), 3600)
+        minutes, secs = divmod(rem, 60)
+        print(
+            f"\r  {label}: {hours:02d}:{minutes:02d}:{secs:02d}  ",
+            end="",
+            flush=True,
+        )
+        time.sleep(1)
+
+
 def send_loop(
     target: str,
     message: str,
@@ -806,8 +846,20 @@ def send_loop(
     on_event: Optional[Callable[[dict], None]] = None,
 ) -> None:
     """Send `message` to `target` after `initial_delay_s`, then optionally
-    repeat every `every_s`. Stops after `count` sends (0 = infinite) or when
-    `stop_event` is set. Fires `on_event(dict)` for GUI hooks."""
+    repeat every `every_s`. Stops after `count` successful sends (0 =
+    infinite) or when `stop_event` is set. Fires `on_event(dict)` for GUI
+    hooks.
+
+    Failure policy. A single-shot run (no interval) ends at the first
+    failed send with done/error, as it always did. A repeat run (interval
+    set, whatever the count) is usually unattended, and most refusals
+    are momentary (a draft in the composer, focus stolen while typing, UI
+    Automation not answering, the app not running yet): the run logs the
+    error, emits a `send_failed` event, waits the interval and tries again,
+    and gives up with done/error only after MAX_CONSECUTIVE_FAILURES failed
+    sends in a row. Failed sends do not count towards `count`. A
+    ConfigurationError (unknown target, untypeable or refused message) can
+    never succeed on retry and ends any run at once."""
     stop_event = stop_event or threading.Event()
 
     def emit(event: dict) -> None:
@@ -819,27 +871,11 @@ def send_loop(
         emit({"type": "log", "text": text})
 
     def wait(seconds: float, label: str) -> bool:
-        if seconds <= 0:
-            return True
-        target_time = datetime.now() + timedelta(seconds=seconds)
-        emit({"type": "status", "text": f"{label} for {int(seconds)}s"})
-        while True:
-            if stop_event.is_set():
-                return False
-            remaining = (target_time - datetime.now()).total_seconds()
-            if remaining <= 0:
-                return True
-            emit({"type": "countdown", "remaining_s": int(remaining)})
-            hours, rem = divmod(int(remaining), 3600)
-            minutes, secs = divmod(rem, 60)
-            print(
-                f"\r  {label}: {hours:02d}:{minutes:02d}:{secs:02d}  ",
-                end="",
-                flush=True,
-            )
-            time.sleep(1)
+        return _countdown_wait(seconds, label, stop_event, emit)
 
+    repeat_run = every_s is not None and every_s > 0
     sent = 0
+    failures = 0  # failed sends in a row; a success resets it
     try:
         if initial_delay_s > 0:
             log(f"[INFO] Initial delay: {initial_delay_s / 60:.1f} minutes")
@@ -855,10 +891,33 @@ def send_loop(
             _wake_screen()
             try:
                 send_once(target, message, log=log)
-            except Exception as e:
+            except ConfigurationError as e:
                 log(f"[ERROR] {e}")
                 emit({"type": "done", "reason": "error"})
                 return
+            except Exception as e:
+                log(f"[ERROR] {e}")
+                if not repeat_run:
+                    emit({"type": "done", "reason": "error"})
+                    return
+                failures += 1
+                emit({"type": "send_failed", "error": str(e),
+                      "consecutive": failures,
+                      "limit": MAX_CONSECUTIVE_FAILURES})
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    log(f"[ERROR] {failures} sends failed in a row; "
+                        f"giving up.")
+                    emit({"type": "done", "reason": "error"})
+                    return
+                log(f"[INFO] Send failed ({failures}/"
+                    f"{MAX_CONSECUTIVE_FAILURES} in a row); trying again "
+                    f"at the next interval.")
+                if not wait(every_s, "Next send"):
+                    emit({"type": "done", "reason": "stopped"})
+                    return
+                print()
+                continue
+            failures = 0
             sent += 1
             emit({"type": "sent", "n": sent})
 
